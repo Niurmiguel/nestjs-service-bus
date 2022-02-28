@@ -2,8 +2,12 @@ import { CustomTransportStrategy, Server } from "@nestjs/microservices";
 import { ServiceBusClient } from "@azure/service-bus";
 import { Inject, Injectable } from "@nestjs/common";
 
-import { ServiceBusModuleOptions } from "../interfaces";
+import {
+  ServiceBusConnectionStringCredentials,
+  ServiceBusModuleOptions,
+} from "../interfaces";
 import { SERVICE_BUS_MODULE_OPTIONS } from "../constants";
+import { ModulesContainer } from "@nestjs/core";
 
 @Injectable()
 export class ServerServiceBus
@@ -11,12 +15,17 @@ export class ServerServiceBus
   implements CustomTransportStrategy
 {
   protected client: ServiceBusClient = null;
+  protected clientConfig: ServiceBusConnectionStringCredentials;
 
   constructor(
-    @Inject(SERVICE_BUS_MODULE_OPTIONS)
-    readonly options: ServiceBusModuleOptions
+    readonly modulesContainer: ModulesContainer,
+    @Inject(SERVICE_BUS_MODULE_OPTIONS) options: ServiceBusModuleOptions
   ) {
     super();
+
+    this.clientConfig = options.client;
+
+    console.log(modulesContainer.values());
 
     this.initializeSerializer(options);
     this.initializeDeserializer(options);
@@ -39,14 +48,11 @@ export class ServerServiceBus
   public async start(callback?: () => void) {
     this.client = this.createClient();
 
-    console.log(this.client);
+    this.logger.warn("Service Bus connection stablished!");
   }
 
   public createClient(): ServiceBusClient {
-    const { connectionString, options } = this.getOptionsProp(
-      this.options,
-      "client"
-    );
+    const { connectionString, options } = this.clientConfig;
     return new ServiceBusClient(connectionString, options);
   }
 }

@@ -8,45 +8,67 @@ import {
 } from "./interfaces";
 import { ServerServiceBus } from "./server";
 
-@Module({
-  providers: [ServerServiceBus],
-})
+@Module({})
 export class ServiceBusModule {
-  constructor(readonly modulesContainer: ModulesContainer) {}
+  // constructor(readonly modulesContainer: ModulesContainer) {}
 
   /**
    * Bootstraps the Service Bus Module synchronously
    * @param {ServiceBusModuleOptions} options The options for the Service Bus Module
    */
   static forRoot(options: ServiceBusModuleOptions): DynamicModule {
-    const providers: Provider[] = [
-      {
-        provide: SERVICE_BUS_MODULE_OPTIONS,
-        useValue: options,
-      },
-    ];
-
-    return {
-      module: ServiceBusModule,
-      providers,
-      exports: providers,
-    };
+    return ServiceBusModule.forRootAsync({
+      useFactory: () => options,
+    });
   }
+  // static forRoot(options: ServiceBusModuleOptions): DynamicModule {
+  //   const providers: Provider[] = [
+  //     {
+  //       provide: SERVICE_BUS_MODULE_OPTIONS,
+  //       useValue: options,
+  //     },
+  //   ];
+
+  //   return {
+  //     module: ServiceBusModule,
+  //     providers,
+  //     exports: providers,
+  //   };
+  // }
 
   /**
    * Bootstrap the Service Bus Module asynchronously
    * @param options The options for the Service Bus module
    */
   static forRootAsync(options: ServiceBusModuleAsyncOptions): DynamicModule {
-    const asyncProviders = this.createAsyncProviders(options);
-
+    const { imports = [], useClass, useFactory, useExisting, inject } = options;
     return {
       module: ServiceBusModule,
-      imports: [...(options.imports || [])],
-      providers: [...asyncProviders],
-      exports: [...asyncProviders],
+      global: true,
+      imports,
+      providers: [
+        {
+          inject,
+          useClass,
+          useFactory,
+          useExisting,
+          provide: SERVICE_BUS_MODULE_OPTIONS,
+        },
+        ServerServiceBus,
+      ],
+      exports: [ServerServiceBus],
     };
   }
+  // static forRootAsync(options: ServiceBusModuleAsyncOptions): DynamicModule {
+  //   const asyncProviders = this.createAsyncProviders(options);
+
+  //   return {
+  //     module: ServiceBusModule,
+  //     imports: [...(options.imports || [])],
+  //     providers: [...asyncProviders],
+  //     exports: [...asyncProviders],
+  //   };
+  // }
 
   private static createAsyncProviders(
     options: ServiceBusModuleAsyncOptions

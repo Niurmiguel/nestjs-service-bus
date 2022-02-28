@@ -1,8 +1,9 @@
 import { CustomTransportStrategy, Server } from "@nestjs/microservices";
 import { ServiceBusClient } from "@azure/service-bus";
-import { Injectable } from "@nestjs/common";
+import { Inject, Injectable } from "@nestjs/common";
 
 import { ServiceBusModuleOptions } from "../interfaces";
+import { SERVICE_BUS_MODULE_OPTIONS } from "../constants";
 
 @Injectable()
 export class ServerServiceBus
@@ -11,7 +12,10 @@ export class ServerServiceBus
 {
   protected client: ServiceBusClient = null;
 
-  constructor(protected readonly options: ServiceBusModuleOptions) {
+  constructor(
+    @Inject(SERVICE_BUS_MODULE_OPTIONS)
+    readonly options: ServiceBusModuleOptions
+  ) {
     super();
 
     this.initializeSerializer(options);

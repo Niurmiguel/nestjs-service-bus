@@ -6,8 +6,11 @@ import {
   ServiceBusModuleOptions,
   ServiceBusOptionsFactory,
 } from "./interfaces";
+import { ServerServiceBus } from "./server";
 
-@Module({})
+@Module({
+  providers: [ServerServiceBus],
+})
 export class ServiceBusModule {
   constructor(readonly modulesContainer: ModulesContainer) {}
 

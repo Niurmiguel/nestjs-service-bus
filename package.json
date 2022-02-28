@@ -1,0 +1,53 @@
+{
+  "name": "@nestjs/service-bus",
+  "version": "0.0.1",
+  "description": "<p align=\"center\">   <a href=\"http://nestjs.com/\" target=\"blank\"><img src=\"https://nestjs.com/img/logo_text.svg\" width=\"320\" alt=\"Nest Logo\" /></a> </p>",
+  "main": "dist/index",
+  "types": "dist/index",
+  "scripts": {
+    "build": "rimraf dist && tsc",
+    "prepublish": "npm run build",
+    "watch": "npx nodemon 'npm run build'",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Niurmiguel/nestjs-service-bus.git"
+  },
+  "author": "Niurmiguel Gonzalez",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/Niurmiguel/nestjs-service-bus/issues"
+  },
+  "homepage": "https://github.com/Niurmiguel/nestjs-service-bus#readme",
+  "peerDependencies": {
+    "@azure/service-bus": "^7.5.0",
+    "@nestjs/common": "^8.3.1",
+    "@nestjs/core": "^8.3.1",
+    "@nestjs/microservices": "^8.3.1",
+    "reflect-metadata": "^0.1.13",
+    "rxjs": "^7.5.4"
+  },
+  "devDependencies": {
+    "@azure/service-bus": "^7.5.0",
+    "@nestjs/common": "^8.3.1",
+    "@nestjs/core": "^8.3.1",
+    "@nestjs/microservices": "^8.3.1",
+    "@types/node": "^17.0.21",
+    "reflect-metadata": "^0.1.13",
+    "rimraf": "^3.0.2",
+    "rxjs": "^7.5.4",
+    "typescript": "^4.5.5"
+  },
+  "keywords": [
+    "azure",
+    "cloud",
+    "service bus",
+    "AMQP",
+    "nestjs",
+    "microservice"
+  ],
+  "dependencies": {
+    "watch": "^1.0.2"
+  }
+}

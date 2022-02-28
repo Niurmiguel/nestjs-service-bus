@@ -8,6 +8,7 @@ import {
 } from "../interfaces";
 import { SERVICE_BUS_MODULE_OPTIONS } from "../constants";
 import { ModulesContainer } from "@nestjs/core";
+import { MetadataExplorer } from "./metadata-explorer";
 
 @Injectable()
 export class ServerServiceBus
@@ -26,6 +27,8 @@ export class ServerServiceBus
     this.clientConfig = options.client;
 
     console.log(modulesContainer.values());
+
+    console.log(new MetadataExplorer());
 
     this.initializeSerializer(options);
     this.initializeDeserializer(options);

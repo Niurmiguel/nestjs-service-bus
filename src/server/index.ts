@@ -1,1 +1,1 @@
-export * from "./service-bus.server";
+export * from './sb.server';

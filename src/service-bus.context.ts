@@ -1,17 +1,21 @@
-import { ServiceBusMessage } from "@azure/service-bus";
-import { BaseRpcContext } from "@nestjs/microservices/ctx-host/base-rpc.context";
-import { SubscriberTypeMap } from "./interfaces";
-import { SubscriberMetadata } from "./metadata";
+import { ServiceBusMessage } from '@azure/service-bus';
+import { BaseRpcContext } from '@nestjs/microservices/ctx-host/base-rpc.context';
+import { SbSubscriberTypeMap } from './interfaces';
+import { SbSubscriberMetadata } from './metadata';
 
-export type ServiceBusContextArgs<
-  T extends keyof SubscriberTypeMap = keyof SubscriberTypeMap
-> = [SubscriberMetadata<T>, ServiceBusMessage];
+export type SbContextArgs<
+  T extends keyof SbSubscriberTypeMap = keyof SbSubscriberTypeMap,
+> = [SbSubscriberMetadata<T>, ServiceBusMessage];
 
-export class ServiceBusContext<
-  T extends keyof SubscriberTypeMap = keyof SubscriberTypeMap
-> extends BaseRpcContext<ServiceBusContextArgs<T>> {
-  constructor(args: ServiceBusContextArgs<T>) {
+export class SbContext<
+  T extends keyof SbSubscriberTypeMap = keyof SbSubscriberTypeMap,
+> extends BaseRpcContext<SbContextArgs<T>> {
+  private message: ServiceBusMessage;
+  private metadata: SbSubscriberMetadata<T>;
+
+  constructor(args: SbContextArgs<T>) {
     super(args);
-    console.log(args);
+    this.metadata = args[0];
+    this.message = args[1];
   }
 }

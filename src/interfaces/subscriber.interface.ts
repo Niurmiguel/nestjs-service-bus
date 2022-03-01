@@ -1,11 +1,11 @@
 import {
   MessageHandlers,
   ServiceBusSessionReceiverOptions,
-} from "@azure/service-bus";
+} from '@azure/service-bus';
 
-export interface SubscriberMetadataOptions {
-  name: string;
-  receiveMode: "peekLock" | "receiveAndDelete";
+export interface SbSubscriberMetadataOptions {
+  subscription: string;
+  receiveMode: 'peekLock' | 'receiveAndDelete';
   handlerOptions?: MessageHandlers;
   sessionOptions?: ServiceBusSessionReceiverOptions;
 
@@ -19,12 +19,13 @@ export interface SubscriberMetadataOptions {
   serverId?: string;
 }
 
-export interface SubscriptionMetadataOptions extends SubscriberMetadataOptions {
-  topicName: string;
-  provision?: any;
+export interface SbSubscriptionMetadataOptions
+  extends SbSubscriberMetadataOptions {
+  topic: string;
+  provision?: any; // todo - types
   // filter etc...
 }
 
-export interface SubscriberTypeMap {
-  subscription: SubscriptionMetadataOptions;
+export interface SbSubscriberTypeMap {
+  subscription: SbSubscriptionMetadataOptions;
 }

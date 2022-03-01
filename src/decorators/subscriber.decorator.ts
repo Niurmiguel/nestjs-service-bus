@@ -1,47 +1,87 @@
-import { EventPattern } from "@nestjs/microservices";
+import { EventPattern } from '@nestjs/microservices';
 
-import { SubscriberMetadata } from "../metadata";
+import {
+  SB_INTERCEPTORS_METADATA,
+  SB_SERVER_SUBSCRIBER_METADATA,
+} from '../constants';
+import { SbSubscriberMetadata } from '../metadata';
+import {
+  MetaOrMetaFactory,
+  SbInterceptor,
+  SbSubscriptionMetadataOptions,
+} from '../interfaces';
+import { Type } from '@nestjs/common';
+import { OperatorFunction } from 'rxjs';
+import { SbContext } from '../service-bus.context';
 
 export type SubscriberMetadataForTarget = Array<{
   key: string | symbol;
-  metadata: any;
+  metadata: SbSubscriberMetadata;
 }>;
+
+export type SbInterceptorMetadataForTarget = Map<
+  string | symbol,
+  Array<SbInterceptor | Type<SbInterceptor>>
+>;
 
 function storeMetadata(
   target: object,
   key: string | symbol,
-  metadata: any
+  metadata: SbSubscriberMetadata,
 ): void {
   const col: SubscriberMetadataForTarget =
-    Reflect.getMetadata(
-      "SERVICE_BUS_SERVER_SUBSCRIBER_CONFIGURATION_METADATA",
-      target
-    ) || [];
+    Reflect.getMetadata(SB_SERVER_SUBSCRIBER_METADATA, target) || [];
   if (col.push({ key, metadata }) === 1) {
-    Reflect.defineMetadata(
-      "SERVICE_BUS_SERVER_SUBSCRIBER_CONFIGURATION_METADATA",
-      col,
-      target
-    );
+    Reflect.defineMetadata(SB_SERVER_SUBSCRIBER_METADATA, col, target);
   }
 }
 
-/**
- * Subscribes to incoming events from a topic
- */
-export function Subscription<T = false>(metadata: any): any {
-  return ((
+export function Subscription(
+  metadata: MetaOrMetaFactory<SbSubscriptionMetadataOptions>,
+) {
+  return (
     target: object,
     key: string | symbol,
-    descriptor?: PropertyDescriptor
+    descriptor?: PropertyDescriptor,
   ) => {
-    const sbSubscriberMetadata = new SubscriberMetadata(
-      "subscription",
-      metadata
+    const sbSubscriberMetadata = new SbSubscriberMetadata(
+      'subscription',
+      metadata,
     );
+
     storeMetadata(target, key, sbSubscriberMetadata);
+
     if (descriptor) {
       return EventPattern(sbSubscriberMetadata)(target, key, descriptor);
     }
-  }) as any;
+  };
+}
+
+export function SbIntercept(
+  ...interceptors: Array<SbInterceptor | Type<SbInterceptor>>
+) {
+  return <
+    T extends Record<K, OperatorFunction<SbContext, any>>,
+    K extends string,
+  >(
+    target: T,
+    key: K,
+  ): void => {
+    const ctrlInterceptors: SbInterceptorMetadataForTarget =
+      Reflect.getMetadata(SB_INTERCEPTORS_METADATA, target) ||
+      new Map<string | symbol, Array<SbInterceptor | Type<SbInterceptor>>>();
+
+    if (ctrlInterceptors.size === 0) {
+      Reflect.defineMetadata(
+        SB_INTERCEPTORS_METADATA,
+        ctrlInterceptors,
+        target,
+      );
+    }
+
+    if (!ctrlInterceptors.has(key)) {
+      ctrlInterceptors.set(key, []);
+    }
+    ctrlInterceptors.get(key).push(...interceptors);
+  };
 }

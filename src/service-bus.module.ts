@@ -1,45 +1,32 @@
-import { DynamicModule, Module, Provider, Type } from "@nestjs/common";
-import { ModulesContainer } from "@nestjs/core";
-import { SERVICE_BUS_MODULE_OPTIONS } from "./constants";
+import { ClientProxy, Closeable } from '@nestjs/microservices';
 import {
-  ServiceBusModuleAsyncOptions,
-  ServiceBusModuleOptions,
-} from "./interfaces";
-import { ServerServiceBus } from "./server";
+  DynamicModule,
+  Inject,
+  Module,
+  OnApplicationShutdown,
+  Optional,
+} from '@nestjs/common';
+
+import { SbModuleOptions } from './interfaces';
+import { SbClient } from './client';
 
 @Module({})
 export class ServiceBusModule {
-  /**
-   * Bootstraps the Service Bus Module synchronously
-   * @param {ServiceBusModuleOptions} options The options for the Service Bus Module
-   */
-  static forRoot(options: ServiceBusModuleOptions): DynamicModule {
-    return ServiceBusModule.forRootAsync({
-      useFactory: () => options,
-    });
-  }
-
-  /**
-   * Bootstrap the Service Bus Module asynchronously
-   * @param options The options for the Service Bus module
-   */
-  static forRootAsync(options: ServiceBusModuleAsyncOptions): DynamicModule {
-    const { imports = [], useClass, useFactory, useExisting, inject } = options;
+  static forRoot(options: SbModuleOptions): DynamicModule {
+    const clients = (options || []).map((item) => ({
+      provide: item.name,
+      useValue: this.assignOnAppShutdownHook(new SbClient(item)),
+    }));
     return {
       module: ServiceBusModule,
-      global: true,
-      imports,
-      providers: [
-        {
-          inject,
-          useClass,
-          useFactory,
-          useExisting,
-          provide: SERVICE_BUS_MODULE_OPTIONS,
-        },
-        ServerServiceBus,
-      ],
-      exports: [ServerServiceBus],
+      providers: clients,
+      exports: clients,
     };
+  }
+
+  private static assignOnAppShutdownHook(client: ClientProxy & Closeable) {
+    (client as unknown as OnApplicationShutdown).onApplicationShutdown =
+      client.close;
+    return client;
   }
 }

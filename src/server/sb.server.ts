@@ -10,7 +10,7 @@ import { SbSubscriberRouteHandler } from "../routing/subscriber-route-handler";
 import { RouteToCommit, SbOptions } from "../interfaces";
 import { SbSubscriberMetadata } from "../metadata";
 import { SbDiscoveryService } from "../discovery";
-import { DiscoveryService, ModulesContainer } from "@nestjs/core";
+import { ModulesContainer } from "@nestjs/core";
 
 @Injectable()
 export class ServiceBusServer
@@ -20,12 +20,12 @@ export class ServiceBusServer
   protected server: ServiceBusClient = null;
 
   constructor(
-    private readonly discovery: DiscoveryService,
+    private readonly modulesContainer: ModulesContainer,
     protected readonly options: SbOptions
   ) {
     super();
 
-    console.log(discovery);
+    console.log(modulesContainer);
 
     this.initializeSerializer(options);
     this.initializeDeserializer(options);

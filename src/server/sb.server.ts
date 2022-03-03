@@ -19,13 +19,8 @@ export class ServiceBusServer
 {
   protected server: ServiceBusClient = null;
 
-  constructor(
-    private readonly modulesContainer: ModulesContainer,
-    protected readonly options: SbOptions
-  ) {
+  constructor(protected readonly options: SbOptions) {
     super();
-
-    console.log(modulesContainer);
 
     this.initializeSerializer(options);
     this.initializeDeserializer(options);

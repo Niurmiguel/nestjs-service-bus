@@ -1,9 +1,22 @@
-import { ModuleMetadata, Provider, Type } from '@nestjs/common';
-import { ServiceBusClientOptions } from '@azure/service-bus';
+import { ModuleMetadata, Provider, Type } from "@nestjs/common";
+import {
+  MessageHandlers,
+  ServiceBusClientOptions,
+  SubscribeOptions,
+} from "@azure/service-bus";
 
-export interface SbOptions {
+export interface SbClientOptions {
   connectionString: string;
   options?: ServiceBusClientOptions;
+}
+export interface SbSubscriptionOptions {
+  handlers: MessageHandlers;
+  options?: SubscribeOptions;
+}
+
+export interface SbOptions {
+  client: SbClientOptions;
+  subscription?: SbSubscriptionOptions;
 }
 
 export type SbProvider = SbOptions;
@@ -19,7 +32,7 @@ export interface SbModuleOptionsFactory {
 }
 
 export interface SbProviderAsyncOptions
-  extends Pick<ModuleMetadata, 'imports'> {
+  extends Pick<ModuleMetadata, "imports"> {
   useExisting?: Type<SbModuleOptionsFactory>;
   useClass?: Type<SbModuleOptionsFactory>;
   useFactory?: (...args: any[]) => Promise<SbProvider> | SbProvider;

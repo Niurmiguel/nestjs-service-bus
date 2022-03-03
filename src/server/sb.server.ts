@@ -1,27 +1,51 @@
-import { CustomTransportStrategy, Server } from '@nestjs/microservices';
-import { ServiceBusClient } from '@azure/service-bus';
-import { Injectable } from '@nestjs/common';
+import {
+  CustomTransportStrategy,
+  MessageHandler,
+  Server,
+} from "@nestjs/microservices";
+import { ServiceBusClient } from "@azure/service-bus";
+import { Injectable } from "@nestjs/common";
 
-import { SbSubscriberRouteHandler } from '../routing/subscriber-route-handler';
-import { RouteToCommit, SbOptions } from '../interfaces';
-import { SbSubscriberMetadata } from '../metadata';
+import { SbSubscriberRouteHandler } from "../routing/subscriber-route-handler";
+import { RouteToCommit, SbOptions } from "../interfaces";
+import { SbSubscriberMetadata } from "../metadata";
+import { SbDiscoveryService } from "../discovery";
+import { DiscoveryService, ModulesContainer } from "@nestjs/core";
 
 @Injectable()
-export class SbServer extends Server implements CustomTransportStrategy {
+export class ServiceBusServer
+  extends Server
+  implements CustomTransportStrategy
+{
   protected server: ServiceBusClient = null;
 
-  constructor(protected readonly options: SbOptions) {
+  constructor(
+    private readonly discovery: DiscoveryService,
+    protected readonly options: SbOptions
+  ) {
     super();
+
+    console.log(discovery);
 
     this.initializeSerializer(options);
     this.initializeDeserializer(options);
+  }
+
+  registerRoute(
+    type: "method",
+    subscriber: SbSubscriberMetadata,
+    handler: MessageHandler
+  ) {
+    console.log({ type, subscriber, handler });
+
+    // this.appendRoute({ type, key, subscriber, instanceWrapper, handler });
   }
 
   /**
    * This method is triggered when you run "app.listen()".
    */
   public async listen(
-    callback: (err?: unknown, ...optionalParams: unknown[]) => void,
+    callback: (err?: unknown, ...optionalParams: unknown[]) => void
   ): Promise<void> {
     try {
       await this.start(callback);
@@ -38,23 +62,22 @@ export class SbServer extends Server implements CustomTransportStrategy {
   }
 
   public async start(callback?: () => void) {
-    this.logger?.debug('Listening for Service Bus messages...');
     this.server = this.createClient();
 
-    const routeInstructions: RouteToCommit<
-      'pipe' | 'method',
-      'subscription'
-    >[] = [];
+    await new SbDiscoveryService(
+      this.messageHandlers,
+      this.registerRoute
+    ).discover();
+
+    const routeInstructions: RouteToCommit<"method", "subscription">[] = [];
 
     this.messageHandlers.forEach((v, k) => {
       const metadata: SbSubscriberMetadata = JSON.parse(k);
-      if (metadata.type === 'subscription') {
+      if (metadata.type === "subscription") {
         routeInstructions.push({
-          type: 'method',
-          key: 'echo',
+          type: "method",
           subscriber: JSON.parse(k),
           handler: v,
-          instanceWrapper: null,
         });
       }
     });
@@ -62,18 +85,19 @@ export class SbServer extends Server implements CustomTransportStrategy {
     if (routeInstructions.length) {
       for (const routeInstruction of routeInstructions) {
         const { subscriber } = routeInstruction;
+
         const receiver = this.server.createReceiver(
           subscriber.metaOptions.topic,
           subscriber.metaOptions.subscription,
           {
             receiveMode: subscriber.metaOptions.receiveMode,
-          },
+          }
         );
 
-        await new SbSubscriberRouteHandler('subscription').verifyAndCreate(
-          routeInstruction,
-          receiver,
-        );
+        new SbSubscriberRouteHandler(
+          "subscription",
+          this.logger
+        ).verifyAndCreate(routeInstruction, receiver);
       }
     }
 
@@ -81,11 +105,10 @@ export class SbServer extends Server implements CustomTransportStrategy {
   }
 
   public createClient(): ServiceBusClient {
-    const connectionString = this.getOptionsProp(
+    const { connectionString, options } = this.getOptionsProp(
       this.options,
-      'connectionString',
+      "client"
     );
-    const options = this.getOptionsProp(this.options, 'options');
     return new ServiceBusClient(connectionString, options);
   }
 }

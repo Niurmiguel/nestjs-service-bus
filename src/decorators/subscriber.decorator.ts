@@ -1,6 +1,6 @@
 import { EventPattern } from "@nestjs/microservices";
 
-import { SB_SERVER_SUBSCRIBER_METADATA } from "../constants";
+import { SB_SUBSCRIBER_METADATA } from "../constants";
 import { SbSubscriberMetadata } from "../metadata";
 import {
   MetaOrMetaFactory,
@@ -18,9 +18,9 @@ function storeMetadata(
   metadata: SbSubscriberMetadata
 ): void {
   const col: SubscriberMetadataForTarget =
-    Reflect.getMetadata(SB_SERVER_SUBSCRIBER_METADATA, target) || [];
+    Reflect.getMetadata(SB_SUBSCRIBER_METADATA, target) || [];
   if (col.push({ key, metadata }) === 1) {
-    Reflect.defineMetadata(SB_SERVER_SUBSCRIBER_METADATA, col, target);
+    Reflect.defineMetadata(SB_SUBSCRIBER_METADATA, col, target);
   }
 }
 

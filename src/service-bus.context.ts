@@ -27,4 +27,8 @@ export class ServiceBusContext<
   getBody<TBody = any>(): TBody {
     return this.args[1].body;
   }
+
+  getMetadata(): SbSubscriberMetadata<T> {
+    return this.args[0];
+  }
 }

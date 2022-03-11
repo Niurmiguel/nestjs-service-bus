@@ -1,23 +1,5 @@
 import { ModuleMetadata, Provider, Type } from "@nestjs/common";
-import {
-  MessageHandlers,
-  ServiceBusClientOptions,
-  SubscribeOptions,
-} from "@azure/service-bus";
-
-export interface SbClientOptions {
-  connectionString: string;
-  options?: ServiceBusClientOptions;
-}
-export interface SbSubscriptionOptions {
-  handlers: MessageHandlers;
-  options?: SubscribeOptions;
-}
-
-export interface SbOptions {
-  client: SbClientOptions;
-  subscription?: SbSubscriptionOptions;
-}
+import { SbOptions } from "./service-bus.interface";
 
 export type SbProvider = SbOptions;
 

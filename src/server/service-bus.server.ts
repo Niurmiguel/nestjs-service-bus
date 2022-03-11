@@ -55,7 +55,7 @@ export class ServiceBusServer
   public createClient(): ServiceBusClient {
     const { connectionString, options } = this.getOptionsProp(
       this.options,
-      "client"
+      "credentials"
     );
     return new ServiceBusClient(connectionString, options);
   }
@@ -64,48 +64,59 @@ export class ServiceBusServer
     const registeredPatterns = [...this.messageHandlers.keys()];
 
     const subscribeToPattern = async (pattern: string) => {
-      const metadata: SbSubscriberMetadata = JSON.parse(pattern);
-      if (metadata.type === "subscription") {
-        const receiver = this.client.createReceiver(
-          metadata.metaOptions.topic,
-          metadata.metaOptions.subscription,
-          {
-            receiveMode: metadata.metaOptions.receiveMode,
-          }
-        );
-
-        const subscription = receiver.subscribe({
-          processMessage: this.getMessageHandler(pattern),
-          processError: async (args: ProcessErrorArgs) => {
-            this.logger.error(
-              `Error from source ${args.errorSource} occurred: `,
-              args.error
-            );
-
-            if (isServiceBusError(args.error)) {
-              switch (args.error.code) {
-                case "MessagingEntityDisabled":
-                case "MessagingEntityNotFound":
-                case "UnauthorizedAccess":
-                  this.logger.error(
-                    `An unrecoverable error occurred. Stopping processing. ${args.error.code}`,
-                    args.error
-                  );
-                  await subscription.close();
-                  break;
-                case "MessageLockLost":
-                  this.logger.error(
-                    `Message lock lost for message`,
-                    args.error
-                  );
-                  break;
-                case "ServiceBusy":
-                  await delay(1000);
-                  break;
-              }
-            }
-          },
+      const {
+        type,
+        metaOptions: {
+          topic,
+          subscription: name,
+          subQueueType,
+          skipParsingBodyAsJson,
+          receiveMode,
+          options,
+        },
+      }: SbSubscriberMetadata = JSON.parse(pattern);
+      if (type === "subscription") {
+        const receiver = this.client.createReceiver(topic, name, {
+          receiveMode,
+          subQueueType,
+          skipParsingBodyAsJson,
         });
+
+        const subscription = receiver.subscribe(
+          {
+            processMessage: this.getMessageHandler(pattern),
+            processError: async (args: ProcessErrorArgs) => {
+              this.logger.error(
+                `Error from source ${args.errorSource} occurred: `,
+                args.error
+              );
+
+              if (isServiceBusError(args.error)) {
+                switch (args.error.code) {
+                  case "MessagingEntityDisabled":
+                  case "MessagingEntityNotFound":
+                  case "UnauthorizedAccess":
+                    this.logger.error(
+                      `An unrecoverable error occurred. Stopping processing. ${args.error.code}`,
+                      args.error
+                    );
+                    await subscription.close();
+                    break;
+                  case "MessageLockLost":
+                    this.logger.error(
+                      `Message lock lost for message`,
+                      args.error
+                    );
+                    break;
+                  case "ServiceBusy":
+                    await delay(1000);
+                    break;
+                }
+              }
+            },
+          },
+          options
+        );
       }
     };
     await Promise.all(registeredPatterns.map(subscribeToPattern));

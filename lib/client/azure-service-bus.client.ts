@@ -66,7 +66,7 @@ export class AzureServiceBusClient extends AzureServiceBusClientProxy {
       let messages = [
         {
           messageId: packet.id,
-          body: serializedPacket,
+          ...serializedPacket,
           replyTo,
         },
       ];

@@ -7,7 +7,7 @@
     "declarationMap": true,
     "sourceMap": true,
     "outDir": "./dist",
-    "rootDir": "./src",
+    "rootDir": "./lib",
     "strict": true,
     "noImplicitAny": false,
     "strictNullChecks": false,

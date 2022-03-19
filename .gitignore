@@ -64,6 +64,5 @@ typings/
 # build and Play
 play
 
-# remove build or lib from repo
-lib
+# remove build from repo
 dist

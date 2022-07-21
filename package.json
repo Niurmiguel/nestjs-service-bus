@@ -1,6 +1,6 @@
 {
   "name": "@niur/nestjs-service-bus",
-  "version": "0.0.8",
+  "version": "0.0.9",
   "description": "NestJS Azure Service Bus Microservice Transport",
   "main": "dist/index",
   "types": "dist/index",

@@ -20,17 +20,17 @@
   },
   "homepage": "https://github.com/Niurmiguel/nestjs-service-bus#readme",
   "peerDependencies": {
-    "@nestjs/common": "^8.3.1",
-    "@nestjs/core": "^8.3.1",
-    "@nestjs/microservices": "^8.3.1",
+    "@nestjs/common": "^9.1.4",
+    "@nestjs/core": "^9.1.4",
+    "@nestjs/microservices": "^9.1.4",
     "reflect-metadata": "^0.1.13",
     "rxjs": "^7.5.4"
   },
   "devDependencies": {
     "@azure/service-bus": "^7.5.0",
-    "@nestjs/common": "^8.3.1",
-    "@nestjs/core": "^8.3.1",
-    "@nestjs/microservices": "^8.3.1",
+    "@nestjs/common": "^9.1.4",
+    "@nestjs/core": "^9.1.4",
+    "@nestjs/microservices": "^9.1.4",
     "@types/node": "^18.0.6",
     "reflect-metadata": "^0.1.13",
     "rimraf": "^3.0.2",

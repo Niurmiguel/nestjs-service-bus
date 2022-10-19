@@ -63,8 +63,7 @@ export class AzureServiceBusServer
         skipParsingBodyAsJson,
       });
 
-      //   const reciever = this.sbClient.createReceiver(queueName);
-      receiver.subscribe(this.createMessageHandlers(pattern));
+      receiver.subscribe(this.createMessageHandlers(pattern), options);
       await receiver.close();
     };
 

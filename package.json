@@ -1,6 +1,6 @@
 {
   "name": "@niur/nestjs-service-bus",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "description": "NestJS Azure Service Bus Microservice Transport",
   "main": "dist/index",
   "types": "dist/index",
@@ -20,11 +20,11 @@
   },
   "homepage": "https://github.com/Niurmiguel/nestjs-service-bus#readme",
   "peerDependencies": {
-    "@nestjs/common": "^9.3.7",
-    "@nestjs/core": "^9.3.7",
-    "@nestjs/microservices": "^9.3.7",
+    "@nestjs/common": "^10.0.4",
+    "@nestjs/core": "^10.0.4",
+    "@nestjs/microservices": "^10.0.4",
     "reflect-metadata": "^0.1.13",
-    "rxjs": "^7.8.0"
+    "rxjs": "^7.8.1"
   },
   "devDependencies": {
     "@azure/service-bus": "^7.9.0",
@@ -32,7 +32,7 @@
     "@nestjs/core": "^10.0.4",
     "@nestjs/microservices": "^10.0.4",
     "@types/node": "^20.3.3",
-    "reflect-metadata": "^0.1.13",
+    "reflect-metadata": "^0.1.14",
     "rimraf": "^5.0.1",
     "rxjs": "^7.8.1",
     "typescript": "^5.1.6"

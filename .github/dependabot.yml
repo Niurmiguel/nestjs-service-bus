@@ -3,10 +3,15 @@ updates:
   - package-ecosystem: npm
     directory: "/"
     schedule:
-      interval: daily
+      interval: monthly
     open-pull-requests-limit: 10
+    target-branch: "development"
+    ignore:
+      - dependency-name: "*eslint*"
+    labels:
+      - "dependencies"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: daily
+      interval: monthly
     open-pull-requests-limit: 10

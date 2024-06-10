@@ -9,6 +9,7 @@ import {
   ServiceBusClient,
   ServiceBusMessage,
   ServiceBusReceivedMessage,
+  ServiceBusReceiver,
 } from "@azure/service-bus";
 
 import { AzureServiceBusContext } from "../azure-service-bus.context";
@@ -20,7 +21,7 @@ export class AzureServiceBusServer
   implements CustomTransportStrategy
 {
   private sbClient: ServiceBusClient;
-
+  private readonly sbReceivers = new Map<string, ServiceBusReceiver>();
   constructor(protected readonly options: AzureServiceBusOptions) {
     super();
 
@@ -63,12 +64,11 @@ export class AzureServiceBusServer
         skipParsingBodyAsJson,
       });
 
-      receiver.subscribe(this.createMessageHandlers(pattern), options);
-      await receiver.close();
+      await receiver.subscribe(this.createMessageHandlers(pattern), options);
+      this.sbReceivers.set(pattern,receiver);
     };
 
     const registeredPatterns = [...this.messageHandlers.keys()];
-
     await Promise.all(registeredPatterns.map(subscribe));
   }
 
@@ -88,9 +88,8 @@ export class AzureServiceBusServer
   ): Promise<void> {
     const partialPacket = { data: receivedMessage, pattern };
     const packet = await this.deserializer.deserialize(partialPacket);
-
     if (!receivedMessage.replyTo) {
-      const sbContext = new AzureServiceBusContext([]);
+      const sbContext = new AzureServiceBusContext([this.sbReceivers.get(packet.pattern)]);
       return this.handleEvent(packet.pattern, packet, sbContext);
     }
 
@@ -124,6 +123,10 @@ export class AzureServiceBusServer
   }
 
   async close(): Promise<void> {
+    const registeredReceivers= [...this.sbReceivers.keys()]
+    await Promise.all(registeredReceivers.map(async key=>{
+      await this.sbReceivers.get(key).close();
+    }))
     await this.sbClient?.close();
   }
 }

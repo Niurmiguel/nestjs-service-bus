@@ -25,7 +25,7 @@
 To start building Azure Service Bus-based microservices, first install the required packages:
 
 ```bash
-$ npm i --save @azure/service-bus @niur/nestjs-service-bus
+$ npm i nestjs-azure-service-bus-transporter
 ```
 
 ## Server

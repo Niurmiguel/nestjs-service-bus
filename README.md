@@ -285,6 +285,7 @@ this.sbClient.emit(pattern, data);
 
 ## Stay in touch
 
+- Author - [Santiagomrn](https://github.com/Santiagomrn)
 - Author - [Niurmiguel](https://github.com/Niurmiguel)
 
 ## License

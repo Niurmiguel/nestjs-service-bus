@@ -1,6 +1,6 @@
 {
   "name": "nestjs-azure-service-bus-transporter",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "NestJS Azure Service Bus Microservice Transport",
   "main": "dist/index",
   "types": "dist/index",

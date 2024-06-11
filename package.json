@@ -1,6 +1,6 @@
 {
-  "name": "@niur/nestjs-service-bus",
-  "version": "1.1.0",
+  "name": "nestjs-azure-service-bus-transporter",
+  "version": "0.0.2",
   "description": "NestJS Azure Service Bus Microservice Transport",
   "main": "dist/index",
   "types": "dist/index",
@@ -11,14 +11,14 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Niurmiguel/nestjs-service-bus.git"
+    "url": "git+https://github.com/Santiagomrn/nestjs-service-bus"
   },
-  "author": "Niurmiguel Gonzalez",
+  "author": "Santiago Rodriguez",
   "license": "MIT",
   "bugs": {
-    "url": "https://github.com/Niurmiguel/nestjs-service-bus/issues"
+    "url": "https://github.com/Santiagomrn/nestjs-service-bus/issues"
   },
-  "homepage": "https://github.com/Niurmiguel/nestjs-service-bus#readme",
+  "homepage": "https://github.com/Santiagomrn/nestjs-service-bus#readme",
   "peerDependencies": {
     "@nestjs/common": "^10.0.4",
     "@nestjs/core": "^10.0.4",

@@ -20,28 +20,51 @@
 - Safely routing and transferring data and control across service and application boundaries
 - Coordinating transactional work that requires a high-degree of reliability
 
-#### Installation
+## Installation
 
 To start building Azure Service Bus-based microservices, first install the required packages:
 
 ```bash
-$ npm i --save @azure/service-bus @niur/nestjs-service-bus
+$ npm i nestjs-azure-service-bus-transporter
 ```
-#### Overview
+
+## Server
 
 To use the Azure Service Bus strategy, pass the following options object to the `createMicroservice()` method:
 
 ```typescript
 //  main.ts
 
-const app = await NestFactory.createMicroservice<MicroserviceOptions>(AppModule, {
+const app = await NestFactory.createMicroservice<MicroserviceOptions>(
+  AppModule,
+  {
+    strategy: new AzureServiceBusServer({
+      connectionString:
+        "Endpoint=sb://<Name>.servicebus.windows.net/;SharedAccessKeyName=<SharedAccessKeyName>;SharedAccessKey=<SharedAccessKey>",
+      options: {},
+    }),
+  }
+);
+```
+
+To use in a hybrid application, pass the following options object to the `connectMicroservice()` method:
+
+```typescript
+//  main.ts
+const app = await NestFactory.create(AppModule);
+
+await app.connectMicroservice({
   strategy: new AzureServiceBusServer({
-    connectionString: 'Endpoint=sb://<Name>.servicebus.windows.net/;SharedAccessKeyName=<SharedAccessKeyName>;SharedAccessKey=<SharedAccessKey>',
-    options: {}
+    connectionString:
+      "Endpoint=sb://<Name>.servicebus.windows.net/;SharedAccessKeyName=<SharedAccessKeyName>;SharedAccessKey=<SharedAccessKey>",
+    options: {},
   }),
 });
 
+await app.startAllMicroservices();
+await app.listen(3000);
 ```
+
 #### Options
 
 The <strong>Azure Service Bus</strong> strategy exposes the properties described below.
@@ -61,99 +84,75 @@ The <strong>Azure Service Bus</strong> strategy exposes the properties described
   </tr>
 </table>
 
-#### Client
+### Queue Consumer
+
+To access the original Azure Service Bus message use the `Queue` decorator as follows:
 
 ```typescript
-@Module({
-  imports: [
-    AzureServiceBusModule.forRoot([
-      {
-        name: 'SB_CLIENT',
-        connectionString: 'Endpoint=sb://<Name>.servicebus.windows.net/;SharedAccessKeyName=<SharedAccessKeyName>;SharedAccessKey=<SharedAccessKey>',
-        options: {},
-      },
-    ]),
-  ]
-  ...
-})
-
-// or
-
-@Module({
-  imports: [
-    AzureServiceBusModule.forRootAsync([
-      {
-        name: 'SB_CLIENT',
-        useFactory: (configService: ConfigService) => ({
-          connectionString: configService.get('connectionString'),
-          options: {}
-        }),
-        inject: [ConfigService],
-      },
-    ]),
-  ]
-  ...
-})
-
+import { Queue } from '@niur/nestjs-service-bus';
+import { ServiceBusReceiver } from '@azure/service-bus';
+import { Payload, Ctx } from '@nestjs/microservices';
+@Queue({
+    queueName: 'sample-topic',
+    receiveMode: 'peekLock', // or receiveAndDelete
+    options:{
+      autoCompleteMessages:true,
+    }
+  })
+getMessages(
+  @Payload() message: ServiceBusMessage,@Ctx() context:AzureServiceBusContext) {
+   const serviceBusReceiver:ServiceBusReceiver= context.getArgs()[0];
+   console.log(message);
+}
 ```
 
-```typescript
+Options
 
-@Injectable()
-constructor(
-  @Inject('SB_CLIENT') private readonly sbClient: AzureServiceBusClientProxy,
-) {}
+<table>
+  <tr>
+    <td><code>queueName</code></td>
+    <td>Name of the queue we want to receive from.</td>
+  </tr>
+  <tr>
+    <td><code>receiveMode</code></td>
+    <td>Represents the receive mode for the receiver. (read more <a href="https://docs.microsoft.com/azure/service-bus-messaging/message-transfers-locks-settlement#peeklock" rel="nofollow" target="_blank">here</a>).</td>
+  </tr>
+  <tr>
+    <td><code>subQueueType</code></td>
+    <td>Represents the sub queue that is applicable for any queue or subscription. (read more <a href="https://docs.microsoft.com/azure/service-bus-messaging/service-bus-dead-letter-queues" rel="nofollow" target="_blank">here</a>).</td>
+  </tr>
+  <tr>
+    <td><code>maxAutoLockRenewalDurationInMs</code></td>
+    <td>The maximum duration in milliseconds until which the lock on the message will be renewed by the sdk automatically.</td>
+  </tr>
+  <tr>
+    <td><code>skipParsingBodyAsJson</code></td>
+    <td>Option to disable the client from running JSON.parse() on the message body when receiving the message.</td>
+  </tr>
+  <tr>
+    <td><code>options</code></td>
+    <td>Options used when subscribing to a Service Bus queue or subscription.</td>
+  </tr>
+</table>
 
-```
-
-##### Producer
-
-Event-based
-
-```typescript
-
-const pattern = {
-  name: 'sample-topic', // topic name
-  options: {}
-}; // queue name
-const data = {
-  body: 'Example message'
-};
-
-this.sbClient.send(pattern, data).subscribe((response) => {
-  console.log(response); // reply message
-});
-
-```
-
-Message-based
-
-```typescript
-
-const pattern = {
-  name: 'sample-topic', // topic name
-  options: {}
-}; // queue name
-const data = {
-  body: 'Example message'
-};
-this.sbClient.emit(pattern, data);
-```
-
-
-##### Consumer
+### Topic Consumer
 
 To access the original Azure Service Bus message use the `Subscription` decorator as follows:
 
-
 ```typescript
-
+import { Topic } from '@niur/nestjs-service-bus';
+import { Payload, Ctx } from '@nestjs/microservices';
+import { ServiceBusReceiver } from '@azure/service-bus';
 @Subscription({
     topic: 'sample-topic',
     subscription: 'sample-subscription',
     receiveMode: 'peekLock', // or receiveAndDelete
+    options:{
+      autoCompleteMessages:true,
+    }
   })
 getMessages(@Payload() message: ServiceBusMessage) {
+  const serviceBusReceiver: ServiceBusReceiver = context.getArgs()[0];
   console.log(message);
 }
 ```
@@ -191,11 +190,104 @@ Options
   </tr>
 </table>
 
+## Client
 
+```typescript
+//  app.module.ts
+
+@Module({
+  imports: [
+    AzureServiceBusModule.forRoot([
+      {
+        name: 'SB_CLIENT',
+        connectionString: 'Endpoint=sb://<Name>.servicebus.windows.net/;SharedAccessKeyName=<SharedAccessKeyName>;SharedAccessKey=<SharedAccessKey>',
+        options: {},
+      },
+    ]),
+  ]
+  ...
+})
+
+// or
+
+@Module({
+  imports: [
+    AzureServiceBusModule.forRootAsync([
+      {
+        name: 'SB_CLIENT',
+        useFactory: (configService: ConfigService) => ({
+          connectionString: configService.get('connectionString'),
+          options: {}
+        }),
+        inject: [ConfigService],
+      },
+    ]),
+  ]
+  ...
+})
+
+```
+
+Since AzureServiceBusModule is a global module you can inject Clients into other modules providers and even controllers.
+
+```typescript
+//example.service.ts
+//provider
+@Injectable()
+export class exampleService {
+  constructor(
+    @Inject("SB_CLIENT") private readonly sbClient: AzureServiceBusClientProxy
+  ) {}
+}
+```
+
+```typescript
+//example.controller.ts
+//controller
+@Controller("example")
+export class exampleController {
+  constructor(
+    @Inject("SB_CLIENT") private readonly sbClient: AzureServiceBusClientProxy
+  ) {}
+}
+```
+
+### Producer
+
+Event-based
+
+```typescript
+const pattern = {
+  name: "sample-topic", // topic/queue name
+  options: {},
+};
+const data = {
+  body: "Example message",
+};
+
+this.sbClient.send(pattern, data).subscribe((response) => {
+  console.log(response); // reply message
+});
+```
+
+Message-based
+
+```typescript
+const pattern = {
+  name: "sample-topic", // topic/queue name
+  options: {},
+};
+const data = {
+  body: "Example message",
+};
+this.sbClient.emit(pattern, data);
+```
 
 ## Stay in touch
 
-* Author - [Niurmiguel](https://github.com/Niurmiguel)
+- Author - [Santiagomrn](https://github.com/Santiagomrn)
+- Author - [Niurmiguel](https://github.com/Niurmiguel)
 
 ## License
+
 Nestjs Azure Service Bus is [MIT licensed](LICENSE).

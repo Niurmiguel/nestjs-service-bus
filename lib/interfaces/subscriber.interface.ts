@@ -62,3 +62,12 @@ export interface SbSubscriptionMetadataOptions
 export interface SbSubscriberTypeMap {
   subscription: SbSubscriptionMetadataOptions;
 }
+
+
+export interface SbQueueMetadataOptions
+  extends Omit<SbSubscriberMetadataOptions,"subscription"> {
+  /**
+   * Name of the topic for the subscription we want to receive from.
+   */
+  queueName: string;
+}

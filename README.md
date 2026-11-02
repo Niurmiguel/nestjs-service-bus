@@ -205,7 +205,7 @@ For several clients, use sessions: each client then receives only the replies se
 
 While the reply queue is being replaced, set `replyTimeoutInMs` on the clients, so that a request whose reply is lost fails instead of waiting forever.
 
-Clients before 1.2.0 take the first message on their reply queue as the whole response, whatever its `correlationId`. A 1.2.0 server therefore sends them a single reply (the first value, the error or the end of an empty response) and nothing more, so that no later request of theirs gets it as an answer; the handler's Observable is unsubscribed after that reply. Upgrade the clients to get streamed responses and errors.
+Clients before 1.2.0 take the first message on their reply queue as the whole response, whatever its `correlationId`. A 1.2.0 server therefore sends them a single reply (the first value, the error or the end of an empty response) and nothing more, so that no later request of theirs gets it as an answer; the handler's Observable is unsubscribed after that reply. Upgrade the clients to get streamed responses and errors. Clients before 1.2.0 and 1.2.0 clients must not share a reply queue: an older client takes the replies meant for the newer ones, and a 1.2.0 client dead-letters the replies to an older client whose `correlationId` is not a request id (e.g. a `messageId` of its own).
 
 ##### Consumer
 
@@ -317,14 +317,16 @@ The default leaves a few seconds before Kubernetes' default `terminationGracePer
 
 ## Security
 
-**Give each side only the rights it needs.** With shared access policies (SAS) defined on each entity, or with the Microsoft Entra roles *Azure Service Bus Data Sender* / *Data Receiver* scoped to each entity:
+**Give each side only the rights it needs.** Use the Microsoft Entra roles *Azure Service Bus Data Sender* / *Azure Service Bus Data Receiver* assigned to each entity, or shared access policies (SAS) defined on each queue or topic:
 
 | Who | Send | Listen |
 | --- | --- | --- |
 | Clients (`send()`) | the request entity | their reply queue `<entity>.reply` |
 | Clients (`emit()`) | the entity | — |
-| Servers that answer requests | `<entity>.reply` only | the request queue or subscription |
-| Servers that only handle events | — | the queue or subscription |
+| Servers that answer requests | `<entity>.reply` only | the request queue, or the subscription (see below) |
+| Servers that only handle events | — | the queue, or the subscription (see below) |
+
+A SAS policy cannot be defined on a subscription, only on the namespace, a queue or a topic: to receive from a subscription with SAS, a server needs Listen on its topic, which covers **every** subscription of that topic. To limit a server to one subscription, assign it *Azure Service Bus Data Receiver* on that subscription with Microsoft Entra ID (the Azure portal does not assign roles at the subscription level; use the Azure CLI, PowerShell or a template). See [SAS](https://learn.microsoft.com/azure/service-bus-messaging/service-bus-sas#configuration-for-sas-authentication) and [Entra ID](https://learn.microsoft.com/azure/service-bus-messaging/authenticate-application#resource-scope).
 
 Avoid a namespace-wide policy such as `RootManageSharedAccessKey` (it also grants *Manage*) in applications.
 

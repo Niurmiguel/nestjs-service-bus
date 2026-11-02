@@ -232,6 +232,13 @@ Read these before upgrading a service that relies on the 1.1.0 behavior.
     handler still arrives as a successful `null`: those servers send no error.
     A caller that sets its own `messageId` on `send()` gets no reply (that
     server replies to the `messageId`, not to the request id).
+  - 1.1.0 and 1.2.0 clients must not share a reply queue (`<entity>.reply`):
+    a 1.1.0 client takes any message there as its answer, including the
+    replies meant for 1.2.0 clients, and a 1.2.0 client dead-letters at once
+    (`InvalidCorrelationId`) the replies whose `correlationId` does not have
+    the shape of a request id, such as a reply to a 1.1.0 client that set its
+    own `messageId`. Upgrade all the clients of an entity together, or give
+    them separate entities while you do.
   - `replySessions` needs 1.2.0 servers.
 
 ### Upgrading from 1.1.0

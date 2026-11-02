@@ -1,3 +1,4 @@
+import { Logger } from "@nestjs/common";
 import { isNil } from "@nestjs/common/utils/shared.utils";
 import { ClientProxy } from "@nestjs/microservices";
 import {
@@ -7,6 +8,7 @@ import {
   Observable,
   Observer,
   Subject,
+  tap,
   throwError,
 } from "rxjs";
 
@@ -16,6 +18,8 @@ import { ServiceBusMessage, ServiceBusMessageBatch } from "@azure/service-bus";
 import { AmqpAnnotatedMessage } from "@azure/core-amqp";
 
 export abstract class AzureServiceBusClientProxy extends ClientProxy {
+  protected readonly logger = new Logger("AzureServiceBusClient");
+
   public send<
     TResult = AzureServiceBusSenderOptions,
     TInput =
@@ -52,11 +56,24 @@ export abstract class AzureServiceBusClientProxy extends ClientProxy {
     if (isNil(pattern) || isNil(data)) {
       return throwError(() => new InvalidMessageException());
     }
+    let subject: Subject<TResult>;
     const source = defer(async () => this.connect()).pipe(
-      mergeMap(() => this.dispatchEvent({ pattern, data }))
+      mergeMap(() => this.dispatchEvent({ pattern, data })),
+      tap({
+        error: (err) => {
+          // emit() is often fire-and-forget: with nobody subscribed, the error
+          // would otherwise vanish.
+          if (!subject.observed) {
+            this.logger.error(
+              `Could not emit to "${pattern?.name}": ${err?.message ?? err}`,
+              err?.stack
+            );
+          }
+        },
+      })
     );
     const connectableSource = connectable(source, {
-      connector: () => new Subject(),
+      connector: () => (subject = new Subject()),
       resetOnDisconnect: false,
     });
     connectableSource.connect();

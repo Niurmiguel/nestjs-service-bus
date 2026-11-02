@@ -15,6 +15,27 @@ import {
   AzureServiceBusSenderOptions,
 } from "../interfaces";
 
+/**
+ * Reads the entity name and the send options from the pattern object the
+ * caller passed. Not from its string form (`normalizePattern()`): that loses
+ * values such as an `AbortSignal` and is not valid JSON when an option is
+ * `undefined`.
+ */
+function readSenderOptions(pattern: unknown): AzureServiceBusSenderOptions {
+  const candidate = pattern as Partial<AzureServiceBusSenderOptions> | null;
+  if (
+    typeof candidate !== "object" ||
+    candidate === null ||
+    typeof candidate.name !== "string" ||
+    candidate.name.length === 0
+  ) {
+    throw new TypeError(
+      'The pattern must be an object like { name: "<queue or topic>", options?: {...} }.'
+    );
+  }
+  return { name: candidate.name, options: candidate.options };
+}
+
 @Injectable()
 export class AzureServiceBusClient extends AzureServiceBusClientProxy {
   private sbClient: ServiceBusClient;
@@ -37,10 +58,7 @@ export class AzureServiceBusClient extends AzureServiceBusClientProxy {
   protected async dispatchEvent<T = any>(
     packet: ReadPacket<any>
   ): Promise<any> {
-    const pattern = this.normalizePattern(packet.pattern);
-    const { name, options } = JSON.parse(
-      pattern
-    ) as AzureServiceBusSenderOptions;
+    const { name, options } = readSenderOptions(packet.pattern);
     const messages = this.serializer.serialize(packet.data);
 
     const sender = this.sbClient.createSender(name);
@@ -54,10 +72,7 @@ export class AzureServiceBusClient extends AzureServiceBusClientProxy {
   ): () => void {
     try {
       const packet = this.assignPacketId(partialPacket);
-      const pattern = this.normalizePattern(packet.pattern);
-      const { name, options } = JSON.parse(
-        pattern
-      ) as AzureServiceBusSenderOptions;
+      const { name, options } = readSenderOptions(packet.pattern);
       const serializedPacket = this.serializer.serialize(packet.data);
       const replyTo = this.getReplyTo(name);
       const sender = this.sbClient.createSender(name);

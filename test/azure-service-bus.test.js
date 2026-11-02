@@ -103,8 +103,6 @@ test("client.emit sends the message through a sender and closes it", { timeout: 
     },
   };
 
-  // The pattern goes through a string round trip, so only JSON-safe options
-  // survive (an AbortSignal, for instance, does not).
   const sendOptions = { tracingOptions: { tracingContext: null } };
   client.emit({ name: "orders", options: sendOptions }, { body: "hello" });
   await sender.done;
@@ -114,6 +112,78 @@ test("client.emit sends the message through a sender and closes it", { timeout: 
   assert.deepEqual(sender.sent[0].messages, { body: "hello" });
   assert.deepEqual(sender.sent[0].options, sendOptions);
   assert.equal(sender.closed, true);
+});
+
+test("client.emit hands the send options to the SDK as given (AbortSignal included)", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  const sender = fakeSender();
+  client.sbClient = { createSender: () => sender };
+
+  const abortSignal = new AbortController().signal;
+  await lastValueFrom(client.emit({ name: "orders", options: { abortSignal } }, { body: 1 }), {
+    defaultValue: undefined,
+  });
+  assert.equal(sender.sent[0].options.abortSignal, abortSignal);
+});
+
+test("client.emit accepts send options with undefined values", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  const sender = fakeSender();
+  client.sbClient = { createSender: () => sender };
+
+  await lastValueFrom(
+    client.emit({ name: "orders", options: { abortSignal: undefined } }, { body: 1 }),
+    { defaultValue: undefined }
+  );
+  assert.equal(sender.sent.length, 1);
+});
+
+test("client.send hands the send options to the SDK as given", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  const sender = fakeSender();
+  client.sbClient = {
+    createSender: () => sender,
+    createReceiver: () => ({ subscribe: () => ({ close: async () => {} }), close: async () => {} }),
+  };
+
+  const abortSignal = new AbortController().signal;
+  const subscription = client
+    .send({ name: "orders", options: { abortSignal, tracingOptions: undefined } }, { body: 1 })
+    .subscribe({ error: () => {} });
+  for (let i = 0; i < 20 && sender.sent.length === 0; i++) await new Promise((r) => setImmediate(r));
+  subscription.unsubscribe();
+  assert.equal(sender.sent.length, 1);
+  assert.equal(sender.sent[0].options.abortSignal, abortSignal);
+});
+
+test("client.emit with no subscriber logs a send that fails", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  const logged = [];
+  client.logger = { error: (...args) => logged.push(args), warn() {}, debug() {}, log() {} };
+  const sender = fakeSender();
+  sender.sendMessages = async () => {
+    throw new Error("entity not found");
+  };
+  client.sbClient = { createSender: () => sender };
+
+  client.emit({ name: "missing" }, { body: 1 }); // fire and forget
+  for (let i = 0; i < 20 && logged.length === 0; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(logged.length, 1);
+  assert.match(String(logged[0][0]), /"missing".*entity not found/);
+});
+
+test("client.emit with a subscriber gives it the error instead of logging it", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  const logged = [];
+  client.logger = { error: (...args) => logged.push(args), warn() {}, debug() {}, log() {} };
+  const sender = fakeSender();
+  sender.sendMessages = async () => {
+    throw new Error("entity not found");
+  };
+  client.sbClient = { createSender: () => sender };
+
+  await assert.rejects(lastValueFrom(client.emit({ name: "missing" }, { body: 1 })), /entity not found/);
+  assert.deepEqual(logged, []);
 });
 
 test("client.emit rejects a missing pattern or payload", async () => {

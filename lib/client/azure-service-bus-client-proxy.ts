@@ -14,20 +14,22 @@ import {
 
 import { AzureServiceBusSenderOptions } from "../interfaces";
 import { InvalidMessageException } from "../errors";
-import { ServiceBusMessage, ServiceBusMessageBatch } from "@azure/service-bus";
-import { AmqpAnnotatedMessage } from "@azure/core-amqp";
+import { ServiceBusSender } from "@azure/service-bus";
+
+/**
+ * What `send()`/`emit()` accept as data: whatever `ServiceBusSender.sendMessages()`
+ * accepts (messages, a batch, AMQP annotated messages). Derived from the SDK
+ * so that the typings do not import `@azure/core-amqp`, which is not a
+ * dependency of this package.
+ */
+type SendableMessages = Parameters<ServiceBusSender["sendMessages"]>[0];
 
 export abstract class AzureServiceBusClientProxy extends ClientProxy {
   protected readonly logger = new Logger("AzureServiceBusClient");
 
   public send<
     TResult = AzureServiceBusSenderOptions,
-    TInput =
-      | ServiceBusMessage
-      | ServiceBusMessage[]
-      | ServiceBusMessageBatch
-      | AmqpAnnotatedMessage
-      | AmqpAnnotatedMessage[]
+    TInput = SendableMessages
   >(pattern: AzureServiceBusSenderOptions, data: TInput): Observable<TResult> {
     if (isNil(pattern) || isNil(data)) {
       return throwError(() => new InvalidMessageException());
@@ -46,12 +48,7 @@ export abstract class AzureServiceBusClientProxy extends ClientProxy {
 
   public emit<
     TResult = AzureServiceBusSenderOptions,
-    TInput =
-      | ServiceBusMessage
-      | ServiceBusMessage[]
-      | ServiceBusMessageBatch
-      | AmqpAnnotatedMessage
-      | AmqpAnnotatedMessage[]
+    TInput = SendableMessages
   >(pattern: AzureServiceBusSenderOptions, data: TInput): Observable<TResult> {
     if (isNil(pattern) || isNil(data)) {
       return throwError(() => new InvalidMessageException());

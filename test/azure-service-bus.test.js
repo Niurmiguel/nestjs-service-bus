@@ -1123,3 +1123,16 @@ test("the context exposes the receiver and the message", () => {
   assert.equal(ctx.getMessage(), message);
   assert.equal(ctx.getArgs()[0], receiver);
 });
+
+test("the published typings do not import @azure/core-amqp (not a dependency)", () => {
+  const { readdirSync, readFileSync } = require("node:fs");
+  const path = require("node:path");
+  const dist = path.join(__dirname, "..", "dist");
+  const typings = readdirSync(dist, { recursive: true }).filter((f) => f.endsWith(".d.ts"));
+  assert.ok(typings.length > 0);
+  for (const file of typings) {
+    const source = readFileSync(path.join(dist, file), "utf8");
+    assert.doesNotMatch(source, /(from\s+|import\()["']@azure\/core-amqp["']/, file);
+  }
+});
+

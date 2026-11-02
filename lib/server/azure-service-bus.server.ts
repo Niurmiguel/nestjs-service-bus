@@ -525,6 +525,11 @@ export class AzureServiceBusServer
       subQueueType: meta.subQueueType,
       skipParsingBodyAsJson: meta.skipParsingBodyAsJson,
     };
+    // Only when set: the SDK's default (5 minutes) applies otherwise, and 0
+    // turns renewal off.
+    if (meta.maxAutoLockRenewalDurationInMs !== undefined) {
+      receiverOptions.maxAutoLockRenewalDurationInMs = meta.maxAutoLockRenewalDurationInMs;
+    }
     const isName = (value: unknown): value is string =>
       typeof value === "string" && value.length > 0;
 

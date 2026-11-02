@@ -915,6 +915,19 @@ test("server uses the queue overload of createReceiver for @Queue", async () => 
   await server.close();
 });
 
+test("server hands maxAutoLockRenewalDurationInMs to the receiver, 0 included", async () => {
+  for (const value of [0, 60_000]) {
+    const fake = fakeServiceBusClient();
+    const server = serverWith(fake, {
+      type: "queue",
+      metaOptions: { queueName: "jobs", receiveMode: "peekLock", maxAutoLockRenewalDurationInMs: value },
+    });
+    await listen(server);
+    assert.equal(fake.receivers[0].args[1].maxAutoLockRenewalDurationInMs, value);
+    await server.close();
+  }
+});
+
 test("server keeps reading @Subscription without a subscription name as a queue", async () => {
   const fake = fakeServiceBusClient();
   const server = serverWith(fake, {

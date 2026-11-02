@@ -496,6 +496,61 @@ describe(
       }
     );
 
+    // itest.lockrenewal has a 5 s lock; the handler takes longer than that.
+    function slowLockController(deliveries, done, maxAutoLockRenewalDurationInMs) {
+      return defineController({
+        onSlow: {
+          decorator: Queue({
+            queueName: "itest.lockrenewal",
+            receiveMode: "peekLock",
+            ...(maxAutoLockRenewalDurationInMs !== undefined && { maxAutoLockRenewalDurationInMs }),
+          }),
+          fn: async (message) => {
+            if (message.body?.runId !== runId) return;
+            deliveries.push(message.deliveryCount);
+            if (deliveries.length === 1) {
+              await delay(8_000);
+            } else {
+              done.resolve();
+            }
+          },
+        },
+      });
+    }
+
+    test("peekLock: the lock is renewed while a handler outlasts it (default)", async () => {
+      const deliveries = [];
+      const { app, logger } = await startMicroservice(slowLockController(deliveries, deferred("unused")));
+      try {
+        await sendRaw("itest.lockrenewal", { runId, kind: "renewed" });
+        for (let i = 0; i < 60 && deliveries.length === 0; i++) await delay(100);
+        await delay(9_000); // the handler, plus time for a redelivery that must not come
+      } finally {
+        await app.close();
+      }
+      assert.deepEqual(deliveries.length, 1, `delivered ${deliveries.length} times`);
+      assert.deepEqual(logger.errors(), []);
+      assert.deepEqual(await remaining("itest.lockrenewal"), []);
+    });
+
+    test("peekLock: maxAutoLockRenewalDurationInMs: 0 turns lock renewal off", async () => {
+      const deliveries = [];
+      const done = deferred("the redelivery after the lock expired", 30_000);
+      const { app, logger } = await startMicroservice(slowLockController(deliveries, done, 0));
+      try {
+        await sendRaw("itest.lockrenewal", { runId, kind: "not-renewed" });
+        await done.promise;
+      } finally {
+        await app.close();
+      }
+      // The lock expired during the first run: completing it failed, and the
+      // message came back.
+      assert.equal(deliveries.length, 2);
+      assert.equal(deliveries[1], deliveries[0] + 1);
+      assert.match(String(logger.errors()[0]?.message), /Could not complete message/);
+      assert.deepEqual(await remaining("itest.lockrenewal"), []);
+    });
+
     test("close() waits for in-flight handlers and settles their messages", async () => {
       const started = deferred("the handler to start");
       let finished = false;

@@ -241,6 +241,82 @@ describe(
       assert.equal(code, 0, output());
     });
 
+    /**
+     * A @Queue handler that echoes `n` back after a random delay. It handles
+     * the requests concurrently, so the replies come out of order.
+     */
+    function echoController(queueName) {
+      return defineController({
+        echo: {
+          decorator: Queue({ queueName, receiveMode: "peekLock", options: { maxConcurrentCalls: 16 } }),
+          fn: async (message) => {
+            await delay(Math.floor(Math.random() * 300));
+            return { n: message.body.n, runId: message.body.runId };
+          },
+        },
+      });
+    }
+
+    test("concurrent send() calls each get their own reply", async () => {
+      const { app } = await startMicroservice(echoController("itest.rpc"));
+      const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+      client.logger = captureLogger();
+      try {
+        const replies = await Promise.race([
+          Promise.all(
+            Array.from({ length: 12 }, (_, n) =>
+              firstValueFrom(client.send({ name: "itest.rpc" }, { body: { n, runId } }))
+            )
+          ),
+          timeoutAfter(30_000),
+        ]);
+        assert.notEqual(replies, "timeout", "not every send() got a reply");
+        assert.deepEqual(
+          replies.map((reply) => reply.n),
+          Array.from({ length: 12 }, (_, n) => n)
+        );
+        assert.ok(replies.every((reply) => reply.runId === runId));
+      } finally {
+        await client.close();
+        await app.close();
+      }
+    });
+
+    test("replySessions: clients sharing a reply queue each get only their replies", async () => {
+      const { app } = await startMicroservice(echoController("itest.rpc.sessions"));
+      const clients = [0, 1].map(
+        () => new AzureServiceBusClient({ connectionString: CONNECTION_STRING, replySessions: true })
+      );
+      for (const client of clients) client.logger = captureLogger();
+      try {
+        const sendAll = (client, offset) =>
+          Promise.all(
+            Array.from({ length: 6 }, (_, i) =>
+              firstValueFrom(
+                client.send({ name: "itest.rpc.sessions" }, { body: { n: offset + i, runId } })
+              )
+            )
+          );
+        const results = await Promise.race([
+          Promise.all([sendAll(clients[0], 0), sendAll(clients[1], 100)]),
+          timeoutAfter(30_000),
+        ]);
+        assert.notEqual(results, "timeout", "not every send() got a reply");
+        assert.deepEqual(results[0].map((r) => r.n), [0, 1, 2, 3, 4, 5]);
+        assert.deepEqual(results[1].map((r) => r.n), [100, 101, 102, 103, 104, 105]);
+        // In its own session, a client never sees the other one's replies.
+        for (const client of clients) {
+          assert.deepEqual(
+            client.logger.entries.filter((e) => /Abandoned a reply/.test(String(e.message))),
+            []
+          );
+        }
+      } finally {
+        await Promise.all(clients.map((client) => client.close()));
+        await app.close();
+      }
+    });
+
     test("send() to an entity that does not exist errors the Observable", async () => {
       const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
       try {

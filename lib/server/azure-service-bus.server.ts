@@ -12,8 +12,13 @@ import {
   ServiceBusReceiver,
   ServiceBusReceiverOptions,
 } from "@azure/service-bus";
-import { Observable, finalize } from "rxjs";
+import { Observable } from "rxjs";
 
+import {
+  SB_REPLY_DISPOSED_PROPERTY,
+  SB_REPLY_TYPE_PROPERTY,
+  SB_REQUEST_ID_PROPERTY,
+} from "../azure-service-bus.constants";
 import { AzureServiceBusContext } from "../azure-service-bus.context";
 import {
   AzureServiceBusOptions,
@@ -190,21 +195,28 @@ export class AzureServiceBusServer
       await handler(receivedMessage, sbContext)
     );
     if (response$) {
-      await this.sendReply(
-        response$,
-        receivedMessage.replyTo,
-        receivedMessage.messageId as string
-      );
+      await this.sendReply(response$, receivedMessage);
     }
   }
 
-  public getPublisher(replyTo: string, correlationId: string) {
+  /**
+   * Returns the function that publishes one reply packet to `replyTo`. The
+   * reply carries `correlationId` and, when the request asked for one
+   * (`replyToSessionId`), the reply session.
+   */
+  public getPublisher(replyTo: string, correlationId: string, sessionId?: string) {
     return async (data: WritePacket) => {
       const sender = this.sbClient.createSender(replyTo);
-      const responseMessage = {
+      const type = data.err ? "error" : "response" in data ? "response" : "none";
+      const responseMessage: ServiceBusMessage = {
         correlationId,
-        body: data.response,
-      } as ServiceBusMessage;
+        body: data.err ?? data.response,
+        applicationProperties: {
+          [SB_REPLY_TYPE_PROPERTY]: type,
+          [SB_REPLY_DISPOSED_PROPERTY]: data.isDisposed === true,
+        },
+        ...(sessionId && { sessionId }),
+      };
       try {
         await sender.sendMessages([responseMessage]);
       } finally {
@@ -292,41 +304,70 @@ export class AzureServiceBusServer
   }
 
   /**
-   * Publishes the handler's response and resolves once it has been sent, so
-   * the message is not settled (nor the server closed) before the reply leaves.
+   * Publishes the handler's response, one reply per value, and resolves once
+   * it has been sent, so the request is not settled (nor the server closed)
+   * before the replies leave. The end of the response travels on the last
+   * value (one message for the usual single-value response).
    */
   private async sendReply(
     response$: Observable<unknown>,
-    replyTo: string,
-    correlationId: string
+    request: ServiceBusReceivedMessage
   ): Promise<void> {
-    const publish = this.getPublisher(replyTo, correlationId);
-    let publishing: Promise<void> = Promise.resolve();
-    const respond = (packet: WritePacket): Promise<void> => {
-      publishing = publishing
-        .then(() => publish(packet))
-        .catch((err) =>
-          // Nothing else can be done with a reply that cannot be sent, and
-          // rethrowing would be an unhandled rejection inside Nest.
-          this.logger.error(
-            `Could not send the reply to "${replyTo}": ${err?.message ?? err}`,
-            err?.stack
-          )
-        );
-      return publishing;
-    };
+    const { replyTo } = request;
+    // Clients since 1.2.0 send their request id in a property, so that a
+    // messageId of their own (e.g. for duplicate detection) does not get in
+    // the way; older clients match on the messageId.
+    const requestId = request.applicationProperties?.[SB_REQUEST_ID_PROPERTY];
+    const correlationId =
+      typeof requestId === "string" ? requestId : (request.messageId as string);
+    const publish = this.getPublisher(replyTo, correlationId, request.replyToSessionId);
 
+    // Replies go out one after another. After a failure the rest are skipped
+    // (the client could not make sense of them), and the chain never rejects:
+    // a rejection waiting for the end of a long response would be unhandled.
+    let publishing: Promise<void> = Promise.resolve();
+    let failure: { err: unknown } | undefined;
+    const respond = (packet: WritePacket) => {
+      publishing = publishing.then(async () => {
+        if (failure) return;
+        try {
+          await publish(packet);
+        } catch (err) {
+          failure = { err };
+        }
+      });
+    };
     await new Promise<void>((resolve) => {
-      this.send(response$.pipe(finalize(() => resolve())), respond);
+      let last: WritePacket | undefined;
+      response$.subscribe({
+        next: (response) => {
+          if (last) respond(last);
+          last = { response };
+        },
+        error: (err) => {
+          if (last) respond(last);
+          this.logger.error(
+            `The handler of a request on "${replyTo}" failed; no reply was sent: ${
+              (err as Error)?.message ?? JSON.stringify(err)
+            }`
+          );
+          resolve();
+        },
+        complete: () => {
+          respond(last ? { ...last, isDisposed: true } : { isDisposed: true });
+          resolve();
+        },
+      });
     });
-    // Nest hands the last packet to `respond` on a later tick: wait for every
-    // publish it starts.
-    let last: Promise<void>;
-    do {
-      await new Promise((resolve) => setImmediate(resolve));
-      last = publishing;
-      await last;
-    } while (last !== publishing);
+    await publishing;
+    if (failure) {
+      // Nothing else can be done with a reply that cannot be sent.
+      const err = failure.err as Error;
+      this.logger.error(
+        `Could not send the reply to "${replyTo}": ${err?.message ?? err}`,
+        err?.stack
+      );
+    }
   }
 
   private parsePattern(pattern: string): SubscriberPattern {

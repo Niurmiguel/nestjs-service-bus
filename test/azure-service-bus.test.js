@@ -19,7 +19,12 @@ const {
   ReplyTimeoutError,
   Subscription,
 } = require("../dist");
-const { SB_SUBSCRIBER_METADATA } = require("../dist/azure-service-bus.constants");
+const {
+  SB_REPLY_DISPOSED_PROPERTY,
+  SB_REPLY_TYPE_PROPERTY,
+  SB_REQUEST_ID_PROPERTY,
+  SB_SUBSCRIBER_METADATA,
+} = require("../dist/azure-service-bus.constants");
 
 // Never parsed: the SDK client is only created on connect()/listen(), which
 // the tests replace with fakes.
@@ -77,11 +82,49 @@ function fakeClientSdk({ sendMessages } = {}) {
     sdk.receivers.push(receiver);
     return receiver;
   };
+  sdk.acceptSession = async (entity, sessionId, options) => {
+    const receiver = sdk.createReceiver(entity, options);
+    receiver.sessionId = sessionId;
+    return receiver;
+  };
   sdk.close = async () => {
     sdk.closed = true;
   };
   return sdk;
 }
+
+/** A received reply as the SDK hands it to processMessage. */
+function replyMessage(correlationId, body, applicationProperties) {
+  return { correlationId, body, applicationProperties, messageId: `reply-${Math.random()}` };
+}
+
+/** Reply properties a 1.2.0 server sets (see SB_REPLY_* in the constants). */
+const RESPONSE_END = {
+  [SB_REPLY_TYPE_PROPERTY]: "response",
+  [SB_REPLY_DISPOSED_PROPERTY]: true,
+};
+
+/** Starts a send() and collects what its Observable does. */
+function collect(observable) {
+  const events = [];
+  let resolveDone;
+  const done = new Promise((resolve) => (resolveDone = resolve));
+  observable.subscribe({
+    next: (value) => events.push(["next", value]),
+    error: (err) => {
+      events.push(["error", err]);
+      resolveDone();
+    },
+    complete: () => {
+      events.push(["complete"]);
+      resolveDone();
+    },
+  });
+  return { events, done };
+}
+
+/** The request id a send() put on the message it sent. */
+const requestIdOf = (sender) => sender.sent[0].messages[0].messageId;
 
 /** Lets pending promise callbacks and I/O callbacks run `n` times. */
 async function ticks(n = 10) {
@@ -311,7 +354,11 @@ test("client processError on a reply queue logs and resolves", async () => {
   const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
   const logged = [];
   client.logger = silentLogger(logged);
-  const { processError } = client.createMessageHandlers({ id: "r-1", pattern: {}, data: {} });
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+  client.send({ name: "q" }, { body: 1 }).subscribe({ error: () => {} });
+  await ticks();
+  const { processError } = sdk.receivers[0].handlers;
 
   const result = await Promise.race([
     processError({ error: new Error("link detached"), errorSource: "receive", entityPath: "q.reply" }).then(
@@ -362,6 +409,177 @@ test("client.send fails with ReplyTimeoutError after replyTimeoutInMs", async ()
   assert.equal(sdk.receivers[0].closed, true, "the reply receiver was not closed");
 });
 
+test("concurrent send() calls each get their own reply, whatever the arrival order", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  client.logger = silentLogger();
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+
+  const a = collect(client.send({ name: "rpc" }, { body: "a" }));
+  const b = collect(client.send({ name: "rpc" }, { body: "b" }));
+  await ticks();
+  const [senderA, senderB] = sdk.senders;
+  const { processMessage } = sdk.receivers[0].handlers;
+
+  // B's reply arrives first, on the first receiver that was opened.
+  await processMessage(replyMessage(requestIdOf(senderB), "reply-b", RESPONSE_END));
+  await processMessage(replyMessage(requestIdOf(senderA), "reply-a", RESPONSE_END));
+  await Promise.all([a.done, b.done]);
+
+  assert.deepEqual(a.events, [["next", "reply-a"], ["complete"]]);
+  assert.deepEqual(b.events, [["next", "reply-b"], ["complete"]]);
+  assert.equal(sdk.receivers.length, 1, "one reply receiver shared by the requests");
+  assert.notEqual(requestIdOf(senderA), requestIdOf(senderB));
+  await ticks();
+  assert.equal(sdk.receivers[0].closed, true, "closed once no request waits");
+});
+
+test("a reply to a request this client did not send is abandoned, not delivered", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  client.logger = silentLogger();
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+
+  const a = collect(client.send({ name: "rpc" }, { body: "a" }));
+  await ticks();
+  const foreign = replyMessage("another-client-request", "not-yours", RESPONSE_END);
+  await sdk.receivers[0].handlers.processMessage(foreign);
+
+  assert.deepEqual(a.events, []);
+  assert.deepEqual(sdk.receivers[0].abandoned, [foreign]);
+  assert.deepEqual(sdk.receivers[0].completed, []);
+
+  await sdk.receivers[0].handlers.processMessage(
+    replyMessage(requestIdOf(sdk.senders[0]), "mine", RESPONSE_END)
+  );
+  await a.done;
+  assert.deepEqual(a.events, [["next", "mine"], ["complete"]]);
+});
+
+test("a late reply to one of this client's finished requests is completed and dropped", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  client.logger = silentLogger();
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+
+  const a = collect(client.send({ name: "rpc" }, { body: "a" }));
+  const b = collect(client.send({ name: "rpc" }, { body: "b" })); // keeps the receiver open
+  await ticks();
+  const id = requestIdOf(sdk.senders[0]);
+  const receiver = sdk.receivers[0];
+  await receiver.handlers.processMessage(replyMessage(id, "first", RESPONSE_END));
+  await a.done;
+
+  const late = replyMessage(id, "again", RESPONSE_END);
+  await receiver.handlers.processMessage(late);
+  assert.deepEqual(a.events, [["next", "first"], ["complete"]]);
+  assert.deepEqual(b.events, []);
+  assert.equal(receiver.completed.at(-1), late);
+  assert.deepEqual(receiver.abandoned, []);
+});
+
+test("send() marks its messages with the request id and the reply queue", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  client.logger = silentLogger();
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+
+  client
+    .send({ name: "rpc" }, [
+      { body: 1, applicationProperties: { tenant: "t1" } },
+      { body: 2, messageId: "dedup-key" },
+    ])
+    .subscribe({ error: () => {} });
+  await ticks();
+  const [first, second] = sdk.senders[0].sent[0].messages;
+  const id = first.applicationProperties[SB_REQUEST_ID_PROPERTY];
+  assert.equal(typeof id, "string");
+  assert.equal(first.messageId, id);
+  assert.equal(first.replyTo, "rpc.reply");
+  assert.equal(first.applicationProperties.tenant, "t1");
+  // A messageId set by the caller (e.g. for duplicate detection) is kept: the
+  // request id travels in the application property.
+  assert.equal(second.messageId, "dedup-key");
+  assert.equal(second.applicationProperties[SB_REQUEST_ID_PROPERTY], id);
+  assert.equal(first.replyToSessionId, undefined);
+});
+
+test("send() completes on a reply from a 1.1.0 server (no reply properties)", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  client.logger = silentLogger();
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+
+  const a = collect(client.send({ name: "rpc" }, { body: 1 }));
+  await ticks();
+  await sdk.receivers[0].handlers.processMessage(replyMessage(requestIdOf(sdk.senders[0]), 5));
+  await a.done;
+  assert.deepEqual(a.events, [["next", 5], ["complete"]]);
+});
+
+test("send() follows a streamed reply: values, an undefined value and the end", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  client.logger = silentLogger();
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+
+  const a = collect(client.send({ name: "rpc" }, { body: 1 }));
+  const empty = collect(client.send({ name: "rpc" }, { body: 2 }));
+  await ticks();
+  const { processMessage } = sdk.receivers[0].handlers;
+  const idA = requestIdOf(sdk.senders[0]);
+  const idEmpty = requestIdOf(sdk.senders[1]);
+  const value = { [SB_REPLY_TYPE_PROPERTY]: "response", [SB_REPLY_DISPOSED_PROPERTY]: false };
+  await processMessage(replyMessage(idA, 1, value));
+  await processMessage(replyMessage(idA, undefined, RESPONSE_END));
+  await processMessage(
+    replyMessage(idEmpty, undefined, { [SB_REPLY_TYPE_PROPERTY]: "none", [SB_REPLY_DISPOSED_PROPERTY]: true })
+  );
+  await Promise.all([a.done, empty.done]);
+  assert.deepEqual(a.events, [["next", 1], ["next", undefined], ["complete"]]);
+  assert.deepEqual(empty.events, [["complete"]]);
+});
+
+test("send() with replySessions receives its replies in its own session", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING, replySessions: true });
+  const other = new AzureServiceBusClient({ connectionString: CONNECTION_STRING, replySessions: true });
+  client.logger = silentLogger();
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+  other.sbClient = fakeClientSdk();
+
+  const a = collect(client.send({ name: "rpc" }, { body: 1 }));
+  other.send({ name: "rpc" }, { body: 1 }).subscribe({ error: () => {} });
+  await ticks();
+  const [message] = sdk.senders[0].sent[0].messages;
+  const sessionId = message.replyToSessionId;
+  assert.equal(typeof sessionId, "string");
+  assert.notEqual(other.sbClient.senders[0].sent[0].messages[0].replyToSessionId, sessionId);
+  const receiver = sdk.receivers[0];
+  assert.equal(receiver.entity, "rpc.reply");
+  assert.equal(receiver.sessionId, sessionId);
+
+  await receiver.handlers.processMessage(replyMessage(requestIdOf(sdk.senders[0]), "ok", RESPONSE_END));
+  await a.done;
+  assert.deepEqual(a.events, [["next", "ok"], ["complete"]]);
+});
+
+test("client.close fails the requests still waiting for a reply", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  client.logger = silentLogger();
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+
+  const a = collect(client.send({ name: "rpc" }, { body: 1 }));
+  await ticks();
+  await client.close();
+  await a.done;
+  assert.equal(a.events[0][0], "error");
+  assert.match(a.events[0][1].message, /closed before the reply/);
+  assert.equal(sdk.receivers[0].closed, true);
+  assert.equal(sdk.closed, true);
+});
+
 test("client.emit rejects a missing pattern or payload", async () => {
   const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
   await assert.rejects(lastValueFrom(client.emit(null, { body: "x" })), {
@@ -399,6 +617,114 @@ test("server dispatches an event message to its handler with a context", async (
   assert.equal(calls.length, 1);
   assert.equal(calls[0].data, received);
   assert.ok(calls[0].ctx instanceof AzureServiceBusContext);
+});
+
+/** A server whose replies are recorded instead of sent. */
+function replyingServer(handler) {
+  const server = new AzureServiceBusServer({ connectionString: CONNECTION_STRING });
+  server.logger = silentLogger();
+  const replies = [];
+  server.sbClient = {
+    createSender: (entity) => ({
+      sendMessages: async (messages) => replies.push(...messages.map((m) => ({ entity, ...m }))),
+      close: async () => {},
+    }),
+  };
+  server.addHandler("rpc-pattern", handler, true);
+  return { server, replies };
+}
+
+test("server replies with the request id as correlationId, in the reply session", async () => {
+  const { server, replies } = replyingServer(async (message) => message.body * 2);
+
+  await server.handleMessage(
+    {
+      body: 21,
+      messageId: "dedup-key",
+      replyTo: "rpc.reply",
+      replyToSessionId: "client-session",
+      applicationProperties: { [SB_REQUEST_ID_PROPERTY]: "req-1" },
+    },
+    "rpc-pattern"
+  );
+
+  assert.deepEqual(replies, [
+    {
+      entity: "rpc.reply",
+      correlationId: "req-1",
+      sessionId: "client-session",
+      body: 42,
+      applicationProperties: { [SB_REPLY_TYPE_PROPERTY]: "response", [SB_REPLY_DISPOSED_PROPERTY]: true },
+    },
+  ]);
+});
+
+test("server answers a 1.1.0 client by messageId, and streams values with the end on the last one", async () => {
+  const { of } = require("rxjs");
+  const { server, replies } = replyingServer(async () => of(1, 2, 3));
+
+  await server.handleMessage({ body: null, messageId: "m-1", replyTo: "rpc.reply" }, "rpc-pattern");
+
+  assert.deepEqual(
+    replies.map((r) => [r.correlationId, r.sessionId, r.body, r.applicationProperties[SB_REPLY_DISPOSED_PROPERTY]]),
+    [
+      ["m-1", undefined, 1, false],
+      ["m-1", undefined, 2, false],
+      ["m-1", undefined, 3, true],
+    ]
+  );
+});
+
+test("server ends an empty response with a reply that has no value", async () => {
+  const { EMPTY } = require("rxjs");
+  const { server, replies } = replyingServer(async () => EMPTY);
+
+  await server.handleMessage({ body: null, messageId: "m-1", replyTo: "rpc.reply" }, "rpc-pattern");
+
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].body, undefined);
+  assert.deepEqual(replies[0].applicationProperties, {
+    [SB_REPLY_TYPE_PROPERTY]: "none",
+    [SB_REPLY_DISPOSED_PROPERTY]: true,
+  });
+});
+
+test("server logs a reply it cannot send, even in the middle of a long response", async () => {
+  const { Subject } = require("rxjs");
+  const values = new Subject();
+  const { server } = replyingServer(async () => values);
+  const logged = [];
+  server.logger = silentLogger(logged);
+  server.sbClient = {
+    createSender: () => ({
+      sendMessages: async () => {
+        throw new Error("reply queue is gone");
+      },
+      close: async () => {},
+    }),
+  };
+  const unhandled = [];
+  const onUnhandled = (err) => unhandled.push(err);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const handling = server.handleMessage(
+      { body: null, messageId: "m-1", replyTo: "rpc.reply" },
+      "rpc-pattern"
+    );
+    await ticks();
+    values.next(1);
+    values.next(2); // the first reply is sent (and fails) while the response goes on
+    await ticks(20);
+    values.next(3);
+    values.complete();
+    await handling;
+    await ticks();
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+  assert.deepEqual(unhandled, []);
+  assert.equal(logged.filter((e) => e.level === "error").length, 1);
+  assert.match(String(logged[0].args[0]), /Could not send the reply to "rpc.reply": reply queue is gone/);
 });
 
 test("server.unwrap throws before listen", () => {

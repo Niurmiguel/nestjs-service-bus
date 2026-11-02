@@ -29,3 +29,54 @@ jobs:
         if: matrix.nest != '11'
         run: npm install --no-save @nestjs/common@^${{ matrix.nest }} @nestjs/core@^${{ matrix.nest }} @nestjs/microservices@^${{ matrix.nest }}
       - run: npm test
+
+  integration:
+    name: Emulator / NestJS ${{ matrix.nest }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        nest: ["10", "11"]
+    env:
+      # LICENSES: ACCEPT_EULA=Y accepts, for this run, the Microsoft license
+      # terms of the Azure Service Bus emulator
+      # (https://github.com/Azure/azure-service-bus-emulator-installer/blob/main/EMULATOR_EULA.txt)
+      # and of SQL Server for Linux (https://go.microsoft.com/fwlink/?LinkId=746388).
+      # Whoever runs or enables this job accepts those terms.
+      ACCEPT_EULA: "Y"
+      # Fail instead of skipping when the emulator is not reachable.
+      SB_EMULATOR_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24.x"
+          cache: npm
+      - name: Start the Service Bus emulator
+        run: |
+          # Throwaway password for the emulator's local SQL Server.
+          MSSQL_SA_PASSWORD="Sb1-$(openssl rand -hex 16)"
+          echo "::add-mask::$MSSQL_SA_PASSWORD"
+          echo "MSSQL_SA_PASSWORD=$MSSQL_SA_PASSWORD" >> "$GITHUB_ENV"
+          export MSSQL_SA_PASSWORD
+          docker compose -f test/integration/docker-compose.yml up -d
+      - run: npm ci
+      - name: Install NestJS ${{ matrix.nest }}
+        if: matrix.nest != '11'
+        run: npm install --no-save @nestjs/common@^${{ matrix.nest }} @nestjs/core@^${{ matrix.nest }} @nestjs/microservices@^${{ matrix.nest }}
+      - name: Wait for the emulator
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:5300/health | grep -q '"healthy"'; then exit 0; fi
+            sleep 3
+          done
+          docker compose -f test/integration/docker-compose.yml logs
+          exit 1
+      - run: npm run test:integration
+      - name: Emulator logs
+        if: failure()
+        run: docker compose -f test/integration/docker-compose.yml logs
+      - name: Stop the emulator
+        if: always()
+        run: docker compose -f test/integration/docker-compose.yml down -v

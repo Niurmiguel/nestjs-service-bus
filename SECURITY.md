@@ -1,21 +1,33 @@
 # Security Policy
 
-## Supported Versions
+## Supported versions
 
-Use this section to tell people about which versions of your project are
-currently being supported with security updates.
+| Version | Supported |
+| ------- | --------- |
+| 1.2.x   | Yes       |
+| < 1.2   | No        |
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 5.1.x   | :white_check_mark: |
-| 5.0.x   | :x:                |
-| 4.0.x   | :white_check_mark: |
-| < 4.0   | :x:                |
+Security fixes are released as a new 1.2.x version. Upgrade to the latest
+1.2.x release; 1.1.0 and earlier receive no fixes.
 
-## Reporting a Vulnerability
+## Reporting a vulnerability
 
-Use this section to tell people how to report a vulnerability.
+Please do not open a public issue for a vulnerability.
 
-Tell them where to go, how often they can expect to get an update on a
-reported vulnerability, what to expect if the vulnerability is accepted or
-declined, etc.
+Report it privately through GitHub: on the repository
+[Niurmiguel/nestjs-service-bus](https://github.com/Niurmiguel/nestjs-service-bus),
+open the **Security** tab and choose **Report a vulnerability**
+([direct link](https://github.com/Niurmiguel/nestjs-service-bus/security/advisories/new)).
+Only the maintainers can see the report.
+
+Include the version of this package, of NestJS and of `@azure/service-bus`,
+what an attacker can do, and the steps or code to reproduce it.
+
+This is a project maintained in spare time: expect a first answer within a
+couple of weeks. If the report is confirmed, the fix is released and a GitHub
+security advisory is published, crediting you unless you prefer otherwise. If
+it is declined, you get the reason.
+
+Note that the security of request-response also depends on how the Service Bus
+entities and their access rights are set up: see "Security" in the
+[README](https://github.com/Niurmiguel/nestjs-service-bus#security).

@@ -1965,6 +1965,23 @@ test("allowedReplyTo is called once per request", async () => {
   await flaky.server.close();
 });
 
+test("replyTimeToLiveInMs must be at least 1 ms", () => {
+  for (const replyTimeToLiveInMs of [0.5, 0.999]) {
+    assert.throws(
+      () => new AzureServiceBusServer({ connectionString: CONNECTION_STRING, replyTimeToLiveInMs }),
+      RangeError,
+      String(replyTimeToLiveInMs)
+    );
+  }
+  for (const replyTimeToLiveInMs of [1, 60_000, 2 ** 32 - 1, 1e15]) {
+    assert.equal(
+      new AzureServiceBusServer({ connectionString: CONNECTION_STRING, replyTimeToLiveInMs })
+        .replyTimeToLiveInMs,
+      replyTimeToLiveInMs
+    );
+  }
+});
+
 test("close() cancels an endless Observable of an event handler too", async () => {
   const endless = endlessResponse();
   const { server, receiver, logged } = await listeningWith(

@@ -74,7 +74,7 @@ The server (`new AzureServiceBusServer({...})`) also accepts:
   </tr>
   <tr>
     <td><code>replyTimeToLiveInMs</code></td>
-    <td>Time to live of the reply messages, so that a reply nobody receives does not stay in the reply queue. Not set by default (the reply queue's default message time to live applies). Make it longer than the clients' <code>replyTimeoutInMs</code>.</td>
+    <td>Time to live of the reply messages, so that a reply nobody receives does not stay in the reply queue. Not set by default (the reply queue's default message time to live applies). At least <code>1</code>; a smaller value throws a <code>RangeError</code> when the server is created. The SDK caps it at 2<sup>32</sup> - 1 ms (about 49.7 days), and Service Bus at the reply queue's default message time to live. Make it longer than the clients' <code>replyTimeoutInMs</code>.</td>
   </tr>
 </table>
 

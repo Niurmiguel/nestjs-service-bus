@@ -57,6 +57,11 @@ export interface AzureServiceBusServerOptions extends AzureServiceBusOptions {
    * Time to live of the reply messages, so that a reply nobody receives (its
    * client gave up or is gone) does not stay in the reply queue.
    *
+   * At least 1 (millisecond); a smaller value throws a `RangeError` when the
+   * server is created. `Infinity` means not set. The SDK caps the time to
+   * live it sends at 2^32 - 1 ms (about 49.7 days), and Service Bus at the
+   * reply queue's default message time to live.
+   *
    * - **Default**: not set, the reply queue's default message time to live
    *   applies (as in 1.1.0). Set it longer than the `replyTimeoutInMs` of the
    *   clients, or a client still waiting can lose its reply.

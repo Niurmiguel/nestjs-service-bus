@@ -50,16 +50,20 @@ export function readTimerOption(name: string, value: unknown): number | undefine
   );
 }
 
-/** Reads a positive duration that is not a timer (e.g. a message TTL). */
+/**
+ * Reads a duration that is not a timer (e.g. a message TTL): `undefined` or
+ * `Infinity` (not set), or at least 1 millisecond. Less than that is sent as
+ * a time to live of 0, and every message would fail or expire at once.
+ */
 export function readDurationOption(name: string, value: unknown): number | undefined {
   if (value === undefined || value === Infinity) {
     return undefined;
   }
-  if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+  if (typeof value === "number" && Number.isFinite(value) && value >= 1) {
     return value;
   }
   throw new RangeError(
-    `${name} must be a positive number of milliseconds (or Infinity); got ${quote(value)}`
+    `${name} must be a number of milliseconds of at least 1 (or Infinity); got ${quote(value)}`
   );
 }
 

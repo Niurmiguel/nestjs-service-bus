@@ -25,8 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   set by default.
 - Server option `closeTimeoutInMs`: how long `close()` waits for the handlers
   that are running (25 seconds by default; see "Behavior changes").
-- Server option `replyTimeToLiveInMs`: time to live of the reply messages. Not
-  set by default.
+- Server option `replyTimeToLiveInMs`: time to live of the reply messages, at
+  least 1 ms (a smaller value throws a `RangeError`). Not set by default.
 - Exported from the package root: the errors (`ReplyTimeoutError`,
   `InvalidMessageException`), the option and metadata interfaces
   (`AzureServiceBusOptions`, `AzureServiceBusClientOptions`,

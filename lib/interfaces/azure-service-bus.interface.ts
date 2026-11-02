@@ -1,11 +1,63 @@
 import {
   OperationOptionsBase,
   ServiceBusClientOptions,
+  ServiceBusReceivedMessage,
 } from "@azure/service-bus";
 
 export interface AzureServiceBusOptions {
   connectionString: string;
   options?: ServiceBusClientOptions;
+}
+
+/**
+ * Decides whether the server may send the replies of a request to `replyTo`
+ * (the request's `replyTo`; the session it asks for is
+ * `message.replyToSessionId`).
+ */
+export type AllowedReplyTo =
+  | readonly string[]
+  | ((replyTo: string, message: ServiceBusReceivedMessage) => boolean);
+
+/**
+ * Options of `AzureServiceBusServer`: the connection plus what only the server
+ * side uses.
+ */
+export interface AzureServiceBusServerOptions extends AzureServiceBusOptions {
+  /**
+   * Where the server may send replies. A request names its reply queue
+   * (`replyTo`), and anyone who can send to a request entity can name any
+   * entity the server can send to. With this option, a request whose
+   * `replyTo` is not allowed gets no reply and its handler does not run: the
+   * message is dead-lettered (`peekLock`) with the reason
+   * `"ReplyToNotAllowed"`, and a warning is logged.
+   *
+   * - A list of entity names (compared ignoring case, as Service Bus does),
+   *   e.g. `["orders.reply"]`.
+   * - Or a function `(replyTo, message) => boolean`. If it throws, the reply
+   *   is not allowed.
+   * - **Default**: not set, any `replyTo` is answered (as in 1.1.0). Limit
+   *   the server's credentials too: see "Security" in the README.
+   */
+  allowedReplyTo?: AllowedReplyTo;
+  /**
+   * How long `close()` waits for the handlers that are running. When it runs
+   * out, the receivers and the connection are closed anyway and a warning is
+   * logged: the messages of the handlers still running are not settled, so
+   * Service Bus delivers them again once their lock expires.
+   *
+   * - **Default**: `30000` (30 seconds). `Infinity` waits for as long as the
+   *   handlers take; `0` does not wait.
+   */
+  closeTimeoutInMs?: number;
+  /**
+   * Time to live of the reply messages, so that a reply nobody receives (its
+   * client gave up or is gone) does not stay in the reply queue.
+   *
+   * - **Default**: not set, the reply queue's default message time to live
+   *   applies (as in 1.1.0). Set it longer than the `replyTimeoutInMs` of the
+   *   clients, or a client still waiting can lose its reply.
+   */
+  replyTimeToLiveInMs?: number;
 }
 
 /**
@@ -18,7 +70,12 @@ export interface AzureServiceBusClientOptions extends AzureServiceBusOptions {
    * Observable fails with a `ReplyTimeoutError` and the reply, if it still
    * arrives, is dropped.
    *
-   * - **Default**: not set, `send()` waits indefinitely (as in 1.1.0).
+   * From 0 to 2147483647 (2^31 - 1, the longest a Node.js timer can wait);
+   * `0` and `Infinity` mean no limit. Another value throws a `RangeError`
+   * when the client is created.
+   *
+   * - **Default**: not set, `send()` waits indefinitely (as in 1.1.0). Setting
+   *   it is recommended: without it, a request nobody answers waits forever.
    */
   replyTimeoutInMs?: number;
   /**

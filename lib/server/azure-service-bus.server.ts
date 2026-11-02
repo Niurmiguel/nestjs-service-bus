@@ -15,6 +15,7 @@ import {
   ServiceBusReceiverOptions,
 } from "@azure/service-bus";
 import { finalize, isObservable, lastValueFrom, Observable, throwError } from "rxjs";
+import { inspect, InspectOptionsStylized } from "util";
 
 import {
   SB_REPLY_DISPOSED_PROPERTY,
@@ -23,11 +24,17 @@ import {
 } from "../azure-service-bus.constants";
 import { AzureServiceBusContext } from "../azure-service-bus.context";
 import {
-  AzureServiceBusOptions,
+  AzureServiceBusServerOptions,
   SbQueueMetadataOptions,
   SbSubscriberTypeMap,
   SbSubscriptionMetadataOptions,
 } from "../interfaces";
+import {
+  quote,
+  readDurationOption,
+  readTimerOption,
+  redactOptions,
+} from "../utils";
 
 /** A receiver opened by `bindEvents()` and the subscription it is running. */
 interface ActiveReceiver {
@@ -54,6 +61,32 @@ interface ProcessingHooks {
     done: () => Promise<void>
   ) => unknown;
   onProcessingEndHook?: (transportId: unknown, context: unknown) => void;
+}
+
+/** How long `close()` waits for running handlers when not configured. */
+const DEFAULT_CLOSE_TIMEOUT_MS = 30_000;
+
+/** Dead-letter reason of a request whose `replyTo` is not allowed. */
+const REPLY_TO_NOT_ALLOWED = "ReplyToNotAllowed";
+
+/** Turns `allowedReplyTo` into a check, copying a list (the caller keeps it). */
+function readAllowedReplyTo(
+  value: AzureServiceBusServerOptions["allowedReplyTo"]
+): ((replyTo: string, message: ServiceBusReceivedMessage) => boolean) | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value === "function") {
+    return value;
+  }
+  if (Array.isArray(value) && value.every((name) => typeof name === "string")) {
+    // Service Bus entity names are not case-sensitive.
+    const allowed = new Set(value.map((name) => name.toLowerCase()));
+    return (replyTo) => allowed.has(replyTo.toLowerCase());
+  }
+  throw new TypeError(
+    "allowedReplyTo must be a list of entity names or a function (replyTo, message) => boolean"
+  );
 }
 
 /** What Nest's own exception filter sends for an unknown error. */
@@ -88,10 +121,25 @@ export class AzureServiceBusServer
   /** Messages being handled right now, so `close()` can wait for them. */
   private readonly inFlight = new Set<Promise<void>>();
   private closing: Promise<void> | undefined;
+  /** `options.closeTimeoutInMs`, checked. */
+  private readonly closeTimeoutInMs: number;
+  /** `options.replyTimeToLiveInMs`, checked. */
+  private readonly replyTimeToLiveInMs: number | undefined;
+  /** `options.allowedReplyTo` as a check; `undefined` allows every `replyTo`. */
+  private readonly isReplyToAllowed:
+    | ((replyTo: string, message: ServiceBusReceivedMessage) => boolean)
+    | undefined;
 
-  constructor(protected readonly options: AzureServiceBusOptions) {
+  constructor(protected readonly options: AzureServiceBusServerOptions) {
     super();
 
+    this.closeTimeoutInMs =
+      readTimerOption("closeTimeoutInMs", options?.closeTimeoutInMs) ?? DEFAULT_CLOSE_TIMEOUT_MS;
+    this.replyTimeToLiveInMs = readDurationOption(
+      "replyTimeToLiveInMs",
+      options?.replyTimeToLiveInMs
+    );
+    this.isReplyToAllowed = readAllowedReplyTo(options?.allowedReplyTo);
     this.initializeSerializer(options);
     this.initializeDeserializer(options);
   }
@@ -162,7 +210,7 @@ export class AzureServiceBusServer
         return; // close() cancelled the SDK's retries on purpose.
       }
       this.logger.error(
-        `Azure Service Bus ${args.errorSource} error on "${args.entityPath}": ${
+        `Azure Service Bus ${args.errorSource} error on ${quote(args.entityPath)}: ${
           error?.message ?? error
         }`,
         error?.stack
@@ -181,6 +229,10 @@ export class AzureServiceBusServer
   ): Promise<void> {
     const active = this.receivers.get(pattern);
     const peekLock = active?.receiver.receiveMode === "peekLock";
+    if (this.rejectsReplyTo(receivedMessage)) {
+      await this.deadLetterRejected(receivedMessage, active, peekLock);
+      return;
+    }
     let failure: { err: unknown } | undefined;
     try {
       await this.handleMessage(receivedMessage, pattern);
@@ -206,7 +258,9 @@ export class AzureServiceBusServer
       // As with the SDK's auto-completion: report it, the lock will expire
       // and the message will be redelivered.
       this.logger.error(
-        `Could not complete message ${receivedMessage.messageId} on "${active.receiver.entityPath}": ${
+        `Could not complete message ${quote(receivedMessage.messageId)} on ${quote(
+          active.receiver.entityPath
+        )}: ${
           (err as Error)?.message ?? err
         }`,
         (err as Error)?.stack
@@ -220,7 +274,7 @@ export class AzureServiceBusServer
     abandon: boolean,
     err: unknown
   ): Promise<void> {
-    const where = `message ${message.messageId} on "${active?.receiver.entityPath}"`;
+    const where = `message ${quote(message.messageId)} on ${quote(active?.receiver.entityPath)}`;
     if (!abandon) {
       // receiveAndDelete (the message is gone), or the handler settled it.
       this.logger.error(`The handler of ${where} failed: ${describeError(err)}`);
@@ -241,6 +295,54 @@ export class AzureServiceBusServer
   }
 
   /**
+   * Whether `message` is a request whose `replyTo` the `allowedReplyTo`
+   * option does not allow. Logs a warning when it is.
+   */
+  private rejectsReplyTo(message: ServiceBusReceivedMessage): boolean {
+    const { replyTo } = message;
+    if (!replyTo || !this.isReplyToAllowed) {
+      return false;
+    }
+    let allowed = false;
+    try {
+      allowed = this.isReplyToAllowed(replyTo, message) === true;
+    } catch (err) {
+      this.logger.error(`allowedReplyTo threw for replyTo ${quote(replyTo)}: ${describeError(err)}`);
+    }
+    if (!allowed) {
+      this.logger.warn(
+        `Ignored the request ${quote(message.messageId)}: its replyTo ${quote(replyTo)}` +
+          `${
+            message.replyToSessionId ? ` (session ${quote(message.replyToSessionId)})` : ""
+          } is not allowed by allowedReplyTo. The handler did not run and no reply was sent.`
+      );
+    }
+    return !allowed;
+  }
+
+  /** Settles a request that `rejectsReplyTo()`: it is never valid, so no retry. */
+  private async deadLetterRejected(
+    message: ServiceBusReceivedMessage,
+    active: ActiveReceiver | undefined,
+    peekLock: boolean
+  ): Promise<void> {
+    if (!peekLock || !active) {
+      return; // receiveAndDelete: the message is gone already.
+    }
+    try {
+      await active.receiver.deadLetterMessage(message, {
+        deadLetterReason: REPLY_TO_NOT_ALLOWED,
+        deadLetterErrorDescription: "The replyTo of this request is not allowed by the server.",
+      });
+    } catch (err) {
+      this.logger.error(
+        `Could not dead-letter the request ${quote(message.messageId)}; it is delivered again ` +
+          `when its lock expires: ${describeError(err)}`
+      );
+    }
+  }
+
+  /**
    * Nest's `handleEvent()` neither waits for an Observable returned by the
    * handler nor reports its error, and an error thrown by a handler reaches
    * it as exactly that: an Observable that errors (Nest's exception filter).
@@ -255,7 +357,7 @@ export class AzureServiceBusServer
     const handler = this.getHandlerByPattern(pattern);
     if (!handler) {
       return this.logger.error(
-        `There is no matching event handler defined in the remote service. Event pattern: ${pattern}`
+        `There is no matching event handler defined in the remote service. Event pattern: ${quote(pattern)}`
       );
     }
     // Processing hooks exist since NestJS 11.
@@ -295,13 +397,16 @@ export class AzureServiceBusServer
     if (!receivedMessage.replyTo) {
       return this.handleEvent(packet.pattern, packet, sbContext);
     }
+    if (this.rejectsReplyTo(receivedMessage)) {
+      return; // processMessage() settles it; a direct call only gets no reply.
+    }
 
     // Whatever goes wrong, the client gets a reply: an error, not silence.
     let response$: Observable<unknown>;
     try {
       const handler = this.getHandlerByPattern(pattern);
       if (!handler) {
-        throw new Error(`There is no handler for the request pattern ${pattern}`);
+        throw new Error(`There is no handler for the request pattern ${quote(pattern)}`);
       }
       response$ = this.transformToObservable(await handler(receivedMessage, sbContext));
     } catch (err) {
@@ -327,6 +432,7 @@ export class AzureServiceBusServer
           [SB_REPLY_DISPOSED_PROPERTY]: data.isDisposed === true,
         },
         ...(sessionId && { sessionId }),
+        ...(this.replyTimeToLiveInMs !== undefined && { timeToLive: this.replyTimeToLiveInMs }),
       };
       try {
         await sender.sendMessages([responseMessage]);
@@ -361,8 +467,9 @@ export class AzureServiceBusServer
   }
 
   /**
-   * Stops receiving, waits for the messages being handled, then closes the
-   * receivers and the client. Calls made while closing share the same work.
+   * Stops receiving, waits for the messages being handled (up to
+   * `closeTimeoutInMs`), then closes the receivers and the client. Calls made
+   * while closing share the same work.
    */
   async close(): Promise<void> {
     if (!this.closing) {
@@ -385,10 +492,9 @@ export class AzureServiceBusServer
     }
     await Promise.all(active.map(({ subscription }) => settled(subscription.close())));
 
-    // 2. Let the handlers in flight finish (a drain can still deliver one).
-    while (this.inFlight.size > 0) {
-      await Promise.all([...this.inFlight].map(settled));
-    }
+    // 2. Let the handlers in flight finish (a drain can still deliver one),
+    //    for up to closeTimeoutInMs.
+    await this.waitForInFlight();
 
     // 3. Close the links, then the connection.
     const failures = (
@@ -404,6 +510,39 @@ export class AzureServiceBusServer
     await client?.close();
   }
 
+  /**
+   * Waits for the handlers in flight, for up to `closeTimeoutInMs`. When that
+   * runs out it logs a warning and returns: closing the receivers then leaves
+   * their messages unsettled, and Service Bus delivers them again once their
+   * lock expires.
+   */
+  private async waitForInFlight(): Promise<void> {
+    const allDone = (async () => {
+      while (this.inFlight.size > 0) {
+        await Promise.all([...this.inFlight].map(settled));
+      }
+    })();
+    const limit = this.closeTimeoutInMs;
+    if (limit === Infinity) {
+      return allDone;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<true>((resolve) => {
+      timer = setTimeout(() => resolve(true), limit);
+    });
+    try {
+      if (await Promise.race([allDone.then(() => false), timedOut])) {
+        this.logger.warn(
+          `close() waited ${limit} ms (closeTimeoutInMs) and ${this.inFlight.size} handler(s) ` +
+            "are still running. Closing the receivers anyway: those messages are not settled " +
+            "and will be delivered again when their lock expires (peekLock)."
+        );
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   private track(work: Promise<void>): Promise<void> {
     this.inFlight.add(work);
     const forget = () => {
@@ -415,10 +554,23 @@ export class AzureServiceBusServer
   }
 
   /**
-   * Publishes the handler's response, one reply per value, and resolves once
-   * it has been sent, so the request is not settled (nor the server closed)
-   * before the replies leave. The end of the response travels on the last
-   * value (one message for the usual single-value response).
+   * Publishes the handler's response and resolves once its first reply has
+   * been sent (or the response ended), so the request message is not settled
+   * before the client hears back. The rest of a streamed response goes on in
+   * the background; `close()` waits for it (up to `closeTimeoutInMs`).
+   *
+   * Clients since 1.2.0 (the request carries `nestjs-sb-request-id`) get one
+   * reply per value, each as soon as it is emitted. Values emitted together
+   * (in the same tick) are sent together, and the end of the response travels
+   * on the last of them when it comes in that same tick: one message for the
+   * usual single-value response. An end that comes later is a reply of its
+   * own, with no value (type `"none"`). This is how Nest's own transports
+   * batch their replies.
+   *
+   * Older clients (1.1.0) take the first message on their reply queue as the
+   * whole response, whatever its `correlationId`, so any further reply would
+   * reach one of their later requests as its answer. They get exactly one
+   * reply: the first value, the error, or the end of an empty response.
    */
   private async sendReply(
     response$: Observable<unknown>,
@@ -429,8 +581,8 @@ export class AzureServiceBusServer
     // messageId of their own (e.g. for duplicate detection) does not get in
     // the way; older clients match on the messageId.
     const requestId = request.applicationProperties?.[SB_REQUEST_ID_PROPERTY];
-    const correlationId =
-      typeof requestId === "string" ? requestId : (request.messageId as string);
+    const singleReply = typeof requestId !== "string";
+    const correlationId = singleReply ? (request.messageId as string) : requestId;
     const publish = this.getPublisher(replyTo, correlationId, request.replyToSessionId);
 
     // Replies go out one after another. After a failure the rest are skipped
@@ -438,6 +590,8 @@ export class AzureServiceBusServer
     // a rejection waiting for the end of a long response would be unhandled.
     let publishing: Promise<void> = Promise.resolve();
     let failure: { err: unknown } | undefined;
+    let firstSent: () => void;
+    const first = new Promise<void>((resolve) => (firstSent = resolve));
     const respond = (packet: WritePacket) => {
       publishing = publishing.then(async () => {
         if (failure) return;
@@ -447,34 +601,67 @@ export class AzureServiceBusServer
           failure = { err };
         }
       });
+      publishing.then(firstSent);
     };
-    await new Promise<void>((resolve) => {
-      let last: WritePacket | undefined;
+
+    // The replies of the current tick, sent when it ends.
+    let batch: WritePacket[] | undefined;
+    let replied = false;
+    const schedule = (packet: WritePacket) => {
+      if (singleReply) {
+        if (!replied) {
+          replied = true;
+          respond({ ...packet, isDisposed: true });
+        }
+        return;
+      }
+      if (batch) {
+        const last = batch[batch.length - 1];
+        if (packet.isDisposed && !("err" in packet) && !last.err && !last.isDisposed) {
+          // The end, in the same tick as the last value: on that value.
+          batch[batch.length - 1] = { ...last, isDisposed: true };
+        } else {
+          batch.push(packet);
+        }
+        return;
+      }
+      batch = [packet];
+      process.nextTick(() => {
+        const replies = batch;
+        batch = undefined;
+        for (const reply of replies) respond(reply);
+      });
+    };
+
+    const ended = new Promise<void>((resolve) => {
+      // Resolves after the tick that queues the last replies.
+      const end = () => process.nextTick(resolve);
       response$.subscribe({
-        next: (response) => {
-          if (last) respond(last);
-          last = { response };
-        },
+        next: (response) => schedule({ response }),
         error: (err) => {
-          if (last) respond(last);
-          respond({ err: this.toReplyError(err, request), isDisposed: true });
-          resolve();
+          schedule({ err: this.toReplyError(err, request), isDisposed: true });
+          end();
         },
         complete: () => {
-          respond(last ? { ...last, isDisposed: true } : { isDisposed: true });
-          resolve();
+          schedule({ isDisposed: true });
+          end();
         },
       });
     });
-    await publishing;
-    if (failure) {
-      // Nothing else can be done with a reply that cannot be sent.
-      const err = failure.err as Error;
-      this.logger.error(
-        `Could not send the reply to "${replyTo}": ${err?.message ?? err}`,
-        err?.stack
-      );
-    }
+    const finished = (async () => {
+      await ended;
+      await publishing;
+      if (failure) {
+        // Nothing else can be done with a reply that cannot be sent.
+        const err = failure.err as Error;
+        this.logger.error(
+          `Could not send the reply to ${quote(replyTo)}: ${err?.message ?? err}`,
+          err?.stack
+        );
+      }
+    })();
+    this.track(finished);
+    await Promise.race([first, finished]);
   }
 
   /**
@@ -488,12 +675,46 @@ export class AzureServiceBusServer
   private toReplyError(err: unknown, request: ServiceBusReceivedMessage): unknown {
     if (err instanceof Error || err === undefined || err === null) {
       this.logger.error(
-        `The request ${request.messageId} on "${request.replyTo}" failed: ${describeError(err)}`,
+        `The request ${quote(request.messageId)} on ${quote(request.replyTo)} failed: ${describeError(
+          err
+        )}`,
         (err as Error)?.stack
       );
       return { ...UNKNOWN_EXCEPTION };
     }
     return err;
+  }
+
+  /**
+   * What `util.inspect()` (and so `console.log()`) shows: the options without
+   * the connection string's key, and a summary of the connection and the
+   * receivers (SDK objects hold the credentials).
+   */
+  [inspect.custom](depth: number, options: InspectOptionsStylized): string {
+    const name = this.constructor.name;
+    if (depth < 0) {
+      return options.stylize(`[${name}]`, "special");
+    }
+    const view: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(this)) {
+      if (key === "options") {
+        view[key] = redactOptions(value);
+      } else if (key === "sbClient") {
+        view[key] = value
+          ? `[ServiceBusClient ${(value as ServiceBusClient).fullyQualifiedNamespace}]`
+          : value;
+      } else if (key === "receivers") {
+        view[key] = [...(value as Map<string, ActiveReceiver>).values()].map(
+          ({ receiver }) => `[ServiceBusReceiver ${receiver.entityPath}]`
+        );
+      } else {
+        view[key] = value;
+      }
+    }
+    return `${name} ${inspect(view, {
+      ...options,
+      depth: options.depth === null ? null : options.depth - 1,
+    })}`;
   }
 
   private parsePattern(pattern: string): SubscriberPattern {

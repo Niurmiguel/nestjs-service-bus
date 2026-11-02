@@ -5,9 +5,10 @@ import {
   ServiceBusSender,
 } from "@azure/service-bus";
 
-import { ReadPacket, WritePacket } from "@nestjs/microservices";
+import { PacketId, ReadPacket, WritePacket } from "@nestjs/microservices";
 import { Injectable } from "@nestjs/common";
 import { randomUUID } from "crypto";
+import { inspect, InspectOptionsStylized } from "util";
 
 import { AzureServiceBusClientProxy } from "./azure-service-bus-client-proxy";
 import { ReplyRouter } from "./reply-router";
@@ -21,6 +22,7 @@ import {
   AzureServiceBusClientOptions,
   AzureServiceBusSenderOptions,
 } from "../interfaces";
+import { quote, readTimerOption, redactOptions } from "../utils";
 
 /** What `sendMessages()` accepts. */
 type SendableMessages = Parameters<ServiceBusSender["sendMessages"]>[0];
@@ -81,10 +83,15 @@ export class AzureServiceBusClient extends AzureServiceBusClientProxy {
   /** Sends and receiver closes in progress, which `close()` waits for. */
   private readonly inFlight = new Set<Promise<unknown>>();
   private readonly replies: ReplyRouter;
+  /** `options.replyTimeoutInMs`, checked; `undefined` when there is no limit. */
+  private readonly replyTimeoutInMs: number | undefined;
 
   constructor(protected readonly options: AzureServiceBusClientOptions) {
     super();
 
+    const replyTimeoutInMs = readTimerOption("replyTimeoutInMs", options?.replyTimeoutInMs);
+    this.replyTimeoutInMs =
+      replyTimeoutInMs > 0 && replyTimeoutInMs !== Infinity ? replyTimeoutInMs : undefined;
     this.initializeSerializer(options);
     this.initializeDeserializer(options);
     this.replies = new ReplyRouter(
@@ -147,8 +154,8 @@ export class AzureServiceBusClient extends AzureServiceBusClientProxy {
       // A failed send (e.g. the entity does not exist) errors the Observable.
       this.sendTo(name, messages, options).catch((err) => callback({ err }));
 
-      const { replyTimeoutInMs } = this.options;
-      if (replyTimeoutInMs > 0) {
+      const { replyTimeoutInMs } = this;
+      if (replyTimeoutInMs !== undefined) {
         timer = setTimeout(
           () => callback({ err: new ReplyTimeoutError(replyTo, replyTimeoutInMs) }),
           replyTimeoutInMs
@@ -159,6 +166,16 @@ export class AzureServiceBusClient extends AzureServiceBusClientProxy {
       callback({ err });
     }
     return teardown;
+  }
+
+  /**
+   * The request id, which the replies carry as `correlationId`. A random UUID
+   * whatever the NestJS version: NestJS 10 (and 11 before 11.2.8) derives it
+   * from `Math.random()`, and each id there gives away most of the next one,
+   * so a reply could be forged for a request that has not been sent yet.
+   */
+  protected assignPacketId(packet: ReadPacket): ReadPacket & PacketId {
+    return Object.assign(packet, { id: randomUUID() });
   }
 
   public getReplyTo = (pattern: string): string => {
@@ -192,6 +209,33 @@ export class AzureServiceBusClient extends AzureServiceBusClientProxy {
     const client = this.sbClient;
     this.sbClient = undefined;
     await client?.close();
+  }
+
+  /**
+   * What `util.inspect()` (and so `console.log()`) shows: the options without
+   * the connection string's key, and a summary of the connection.
+   */
+  [inspect.custom](depth: number, options: InspectOptionsStylized): string {
+    const name = this.constructor.name;
+    if (depth < 0) {
+      return options.stylize(`[${name}]`, "special");
+    }
+    const view: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(this)) {
+      if (key === "options") {
+        view[key] = redactOptions(value);
+      } else if (key === "sbClient") {
+        view[key] = value
+          ? `[ServiceBusClient ${(value as ServiceBusClient).fullyQualifiedNamespace}]`
+          : value;
+      } else {
+        view[key] = value;
+      }
+    }
+    return `${name} ${inspect(view, {
+      ...options,
+      depth: options.depth === null ? null : options.depth - 1,
+    })}`;
   }
 
   /**
@@ -268,7 +312,7 @@ export class AzureServiceBusClient extends AzureServiceBusClientProxy {
       } finally {
         await sender.close().catch((err) =>
           this.logger.error(
-            `Could not close the sender for "${name}": ${err?.message ?? err}`,
+            `Could not close the sender for ${quote(name)}: ${err?.message ?? err}`,
             err?.stack
           )
         );

@@ -7,6 +7,7 @@ require("reflect-metadata");
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { lastValueFrom } = require("rxjs");
+const { randomUUID } = require("node:crypto");
 const { ServiceBusError } = require("@azure/service-bus");
 const { PATTERN_METADATA } = require("@nestjs/microservices/constants");
 
@@ -64,6 +65,7 @@ function fakeClientSdk({ sendMessages } = {}) {
       closed: false,
       completed: [],
       abandoned: [],
+      deadLettered: [],
       subscribe(handlers, subscribeOptions) {
         receiver.handlers = handlers;
         receiver.subscribeOptions = subscribeOptions;
@@ -74,6 +76,9 @@ function fakeClientSdk({ sendMessages } = {}) {
       },
       async abandonMessage(message) {
         receiver.abandoned.push(message);
+      },
+      async deadLetterMessage(message, options) {
+        receiver.deadLettered.push({ message, options });
       },
       async close() {
         receiver.closed = true;
@@ -442,7 +447,7 @@ test("a reply to a request this client did not send is abandoned, not delivered"
 
   const a = collect(client.send({ name: "rpc" }, { body: "a" }));
   await ticks();
-  const foreign = replyMessage("another-client-request", "not-yours", RESPONSE_END);
+  const foreign = replyMessage(randomUUID(), "not-yours", RESPONSE_END);
   await sdk.receivers[0].handlers.processMessage(foreign);
 
   assert.deepEqual(a.events, []);
@@ -639,8 +644,8 @@ test("server dispatches an event message to its handler with a context", async (
 });
 
 /** A server whose replies are recorded instead of sent. */
-function replyingServer(handler) {
-  const server = new AzureServiceBusServer({ connectionString: CONNECTION_STRING });
+function replyingServer(handler, options = {}) {
+  const server = new AzureServiceBusServer({ connectionString: CONNECTION_STRING, ...options });
   server.logger = silentLogger();
   const replies = [];
   server.sbClient = {
@@ -678,20 +683,70 @@ test("server replies with the request id as correlationId, in the reply session"
   ]);
 });
 
-test("server answers a 1.1.0 client by messageId, and streams values with the end on the last one", async () => {
+/** A request as a 1.2.0 client sends it. */
+const requestFrom120 = (extra = {}) => ({
+  body: null,
+  messageId: "m-1",
+  replyTo: "rpc.reply",
+  applicationProperties: { [SB_REQUEST_ID_PROPERTY]: "req-1" },
+  ...extra,
+});
+
+/** [body, reply type, is the end] of each reply. */
+const replyShape = (replies) =>
+  replies.map((r) => [
+    r.body,
+    r.applicationProperties[SB_REPLY_TYPE_PROPERTY],
+    r.applicationProperties[SB_REPLY_DISPOSED_PROPERTY],
+  ]);
+
+test("server streams values to a 1.2.0 client, with the end on the last one of the same tick", async () => {
   const { of } = require("rxjs");
   const { server, replies } = replyingServer(async () => of(1, 2, 3));
 
-  await server.handleMessage({ body: null, messageId: "m-1", replyTo: "rpc.reply" }, "rpc-pattern");
+  await server.handleMessage(requestFrom120(), "rpc-pattern"); // resolves after the first reply
+  await ticks();
 
   assert.deepEqual(
-    replies.map((r) => [r.correlationId, r.sessionId, r.body, r.applicationProperties[SB_REPLY_DISPOSED_PROPERTY]]),
+    replies.map((r) => [r.correlationId, r.body, r.applicationProperties[SB_REPLY_DISPOSED_PROPERTY]]),
     [
-      ["m-1", undefined, 1, false],
-      ["m-1", undefined, 2, false],
-      ["m-1", undefined, 3, true],
+      ["req-1", 1, false],
+      ["req-1", 2, false],
+      ["req-1", 3, true],
     ]
   );
+});
+
+test("server answers a 1.1.0 client by messageId with a single reply (it reads any further one as the next answer)", async () => {
+  const { of, concat, throwError, Subject } = require("rxjs");
+  const legacy = { body: null, messageId: "m-1", replyTo: "rpc.reply" };
+
+  const stream = replyingServer(async () => of(1, 2, 3));
+  await stream.server.handleMessage(legacy, "rpc-pattern");
+  assert.deepEqual(
+    stream.replies.map((r) => [r.correlationId, ...replyShape([r])[0]]),
+    [["m-1", 1, "response", true]]
+  );
+
+  const failingLater = replyingServer(async () => concat(of(1), throwError(() => ({ status: "error" }))));
+  await failingLater.server.handleMessage(legacy, "rpc-pattern");
+  assert.deepEqual(replyShape(failingLater.replies), [[1, "response", true]]);
+
+  const failing = replyingServer(async () => throwError(() => ({ status: "error", message: "x" })));
+  await failing.server.handleMessage(legacy, "rpc-pattern");
+  assert.deepEqual(replyShape(failing.replies), [[{ status: "error", message: "x" }, "error", true]]);
+
+  // Spread over time: still one reply, sent as soon as the first value comes.
+  const later = new Subject();
+  const spread = replyingServer(async () => later);
+  const handling = spread.server.handleMessage(legacy, "rpc-pattern");
+  await ticks();
+  later.next("first");
+  await handling; // resolves once the first reply is out
+  later.next("second");
+  later.complete();
+  await ticks();
+  assert.deepEqual(replyShape(spread.replies), [["first", "response", true]]);
 });
 
 test("server ends an empty response with a reply that has no value", async () => {
@@ -726,10 +781,7 @@ test("server logs a reply it cannot send, even in the middle of a long response"
   const onUnhandled = (err) => unhandled.push(err);
   process.on("unhandledRejection", onUnhandled);
   try {
-    const handling = server.handleMessage(
-      { body: null, messageId: "m-1", replyTo: "rpc.reply" },
-      "rpc-pattern"
-    );
+    const handling = server.handleMessage(requestFrom120(), "rpc-pattern");
     await ticks();
     values.next(1);
     values.next(2); // the first reply is sent (and fails) while the response goes on
@@ -737,7 +789,7 @@ test("server logs a reply it cannot send, even in the middle of a long response"
     values.next(3);
     values.complete();
     await handling;
-    await ticks();
+    await ticks(20);
   } finally {
     process.off("unhandledRejection", onUnhandled);
   }
@@ -753,7 +805,8 @@ test("server replies with the error when a request handler fails", async () => {
   const filtered = { status: "error", message: "Internal server error" };
   const { server, replies } = replyingServer(async () => concat(of(1), throwError(() => filtered)));
 
-  await server.handleMessage({ body: null, messageId: "m-1", replyTo: "rpc.reply" }, "rpc-pattern");
+  await server.handleMessage(requestFrom120(), "rpc-pattern");
+  await ticks(); // handleMessage() resolves once the first reply is out
 
   assert.deepEqual(
     replies.map((r) => [r.body, r.applicationProperties[SB_REPLY_TYPE_PROPERTY], r.applicationProperties[SB_REPLY_DISPOSED_PROPERTY]]),
@@ -1028,10 +1081,10 @@ test("server completes peekLock messages after the handler unless told not to", 
  * Listens with one @Queue handler and returns the fake receiver, with the
  * settlements it gets recorded.
  */
-async function listeningWith(handler, metaOptions) {
+async function listeningWith(handler, metaOptions, serverOptions = {}) {
   const fake = fakeServiceBusClient();
   const logged = [];
-  const server = new AzureServiceBusServer({ connectionString: CONNECTION_STRING });
+  const server = new AzureServiceBusServer({ connectionString: CONNECTION_STRING, ...serverOptions });
   server.logger = silentLogger(logged);
   server.createServiceBusClient = () => fake.client;
   server.addHandler({ type: "queue", metaOptions: { queueName: "q", ...metaOptions } }, handler, true);
@@ -1039,9 +1092,12 @@ async function listeningWith(handler, metaOptions) {
   const receiver = fake.receivers[0];
   receiver.completed = [];
   receiver.abandoned = [];
+  receiver.deadLettered = [];
   receiver.completeMessage = async (message) => receiver.completed.push(message);
   receiver.abandonMessage = async (message) => receiver.abandoned.push(message);
-  return { server, receiver, logged };
+  receiver.deadLetterMessage = async (message, options) =>
+    receiver.deadLettered.push({ message, options });
+  return { server, receiver, logged, fake };
 }
 
 test("an event handler that throws gets its peekLock message abandoned, not completed", async () => {
@@ -1163,4 +1219,492 @@ test("every package the published code and typings import is a declared peer dep
     }
   }
   assert.deepEqual([...undeclared], []);
+});
+
+// --- Request ids ------------------------------------------------------------
+
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/** Sends `n` requests and returns the request ids they carried. */
+async function requestIds(n) {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  client.logger = silentLogger();
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+  const subscriptions = Array.from({ length: n }, () =>
+    client.send({ name: "rpc" }, { body: 1 }).subscribe({ error: () => {} })
+  );
+  await ticks();
+  const ids = sdk.senders.map((sender) => sender.sent[0].messages[0].applicationProperties[SB_REQUEST_ID_PROPERTY]);
+  for (const subscription of subscriptions) subscription.unsubscribe();
+  return ids;
+}
+
+/** True if `b` starts with what is left of `a` after its first character (uid(21)). */
+const slidesFrom = (a, b) => a.slice(1) === b.slice(0, a.length - 1);
+
+test("request ids are random UUIDs with the installed NestJS", async () => {
+  const ids = await requestIds(5);
+  assert.equal(new Set(ids).size, 5);
+  for (const id of ids) assert.match(id, UUID_V4);
+  for (let i = 1; i < ids.length; i++) assert.ok(!slidesFrom(ids[i - 1], ids[i]), ids.join(" "));
+});
+
+test("request ids do not come from NestJS's assignPacketId (Math.random in NestJS 10)", async () => {
+  const { ClientProxy } = require("@nestjs/microservices");
+  const original = ClientProxy.prototype.assignPacketId;
+  let n = 0;
+  // What NestJS 10 does, made obvious: each id is the previous one shifted.
+  ClientProxy.prototype.assignPacketId = function (packet) {
+    return Object.assign(packet, { id: `predictable-${n++}` });
+  };
+  try {
+    const ids = await requestIds(3);
+    for (const id of ids) assert.match(id, UUID_V4);
+  } finally {
+    ClientProxy.prototype.assignPacketId = original;
+  }
+});
+
+// --- Option checks ----------------------------------------------------------
+
+test("replyTimeoutInMs out of a timer's range throws a RangeError", () => {
+  for (const replyTimeoutInMs of [2 ** 31, -1, Number.NaN, "100", -Infinity]) {
+    assert.throws(
+      () => new AzureServiceBusClient({ connectionString: CONNECTION_STRING, replyTimeoutInMs }),
+      RangeError,
+      String(replyTimeoutInMs)
+    );
+  }
+  for (const replyTimeoutInMs of [undefined, 0, 1, 2 ** 31 - 1, Infinity]) {
+    new AzureServiceBusClient({ connectionString: CONNECTION_STRING, replyTimeoutInMs });
+  }
+});
+
+test("replyTimeoutInMs: 0 or Infinity sets no timer", async () => {
+  for (const replyTimeoutInMs of [0, Infinity]) {
+    const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING, replyTimeoutInMs });
+    client.logger = silentLogger();
+    const sdk = fakeClientSdk();
+    client.sbClient = sdk;
+    const a = collect(client.send({ name: "rpc" }, { body: 1 }));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(a.events, [], String(replyTimeoutInMs));
+    await client.close();
+  }
+});
+
+test("a finished send() leaves no timer behind: the process exits at once", async () => {
+  const { spawn } = require("node:child_process");
+  const path = require("node:path");
+  const child = spawn(process.execPath, [path.join(__dirname, "reply-timer-exit.js")], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let output = "";
+  child.stdout.on("data", (chunk) => (output += chunk));
+  child.stderr.on("data", (chunk) => (output += chunk));
+  const exited = new Promise((resolve) => child.once("exit", (code) => resolve(code)));
+  const outcome = await Promise.race([
+    exited,
+    new Promise((resolve) => setTimeout(resolve, 5000, "still running").unref()),
+  ]);
+  if (outcome === "still running") child.kill("SIGKILL");
+  assert.equal(outcome, 0, output);
+  assert.match(output, /^reply=ok$/m);
+});
+
+test("server options out of range throw when the server is created", () => {
+  for (const closeTimeoutInMs of [2 ** 31, -1, Number.NaN, "5"]) {
+    assert.throws(
+      () => new AzureServiceBusServer({ connectionString: CONNECTION_STRING, closeTimeoutInMs }),
+      RangeError
+    );
+  }
+  for (const replyTimeToLiveInMs of [0, -5, Number.NaN, "60000"]) {
+    assert.throws(
+      () => new AzureServiceBusServer({ connectionString: CONNECTION_STRING, replyTimeToLiveInMs }),
+      RangeError
+    );
+  }
+  for (const allowedReplyTo of ["orders.reply", [1], {}]) {
+    assert.throws(
+      () => new AzureServiceBusServer({ connectionString: CONNECTION_STRING, allowedReplyTo }),
+      TypeError
+    );
+  }
+});
+
+// --- Reply receiver errors --------------------------------------------------
+
+/** Starts a send() and hands its reply receiver's processError to `fn`. */
+async function withPendingSend(fn) {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  const logged = [];
+  client.logger = silentLogger(logged);
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+  const a = collect(client.send({ name: "rpc" }, { body: 1 }));
+  await ticks();
+  await fn(sdk.receivers[0].handlers.processError);
+  await ticks();
+  return { a, client, logged };
+}
+
+test("a receive error the SDK marks as not retryable fails the waiting send()", async () => {
+  // What a receiver without sessions gets on a reply queue with sessions.
+  const error = new ServiceBusError(
+    "It is not possible for an entity that requires sessions to create a non-sessionful message receiver.",
+    "GeneralError"
+  );
+  error.retryable = false;
+  const { a, client, logged } = await withPendingSend((processError) =>
+    processError({ error, errorSource: "receive", entityPath: "rpc.reply" })
+  );
+  await a.done;
+  assert.equal(a.events[0][0], "error");
+  assert.equal(a.events[0][1], error);
+  assert.match(String(logged[0].args[0]), /must not have sessions enabled/);
+  await client.close();
+});
+
+test("retryable receive errors and errors of the reply callback do not fail the waiting send()", async () => {
+  const busy = new ServiceBusError("busy", "ServiceBusy");
+  busy.retryable = true;
+  const lockLost = new ServiceBusError("lock lost", "MessageLockLost");
+  lockLost.retryable = false;
+  const { a, client } = await withPendingSend(async (processError) => {
+    await processError({ error: busy, errorSource: "receive", entityPath: "rpc.reply" });
+    await processError({ error: lockLost, errorSource: "processMessageCallback", entityPath: "rpc.reply" });
+    await processError({ error: lockLost, errorSource: "complete", entityPath: "rpc.reply" });
+  });
+  assert.deepEqual(a.events, []);
+  await client.close();
+});
+
+// --- Replies that are not this client's -------------------------------------
+
+test("a reply whose correlationId is not a request id is dead-lettered at once", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  const logged = [];
+  client.logger = silentLogger(logged);
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+  client.send({ name: "rpc" }, { body: 1 }).subscribe({ error: () => {} });
+  await ticks();
+  const receiver = sdk.receivers[0];
+  const junk = [undefined, "junk", 42, "x".repeat(36), "abcdef0123456789abcdeZ"].map((id) =>
+    replyMessage(id, "junk", RESPONSE_END)
+  );
+  for (const message of junk) await receiver.handlers.processMessage(message);
+  assert.deepEqual(
+    receiver.deadLettered.map((d) => d.message),
+    junk
+  );
+  assert.equal(receiver.deadLettered[0].options.deadLetterReason, "InvalidCorrelationId");
+  assert.deepEqual(receiver.abandoned, []);
+  // Ids of other clients (1.2.0: UUID; 1.1.0 on NestJS 10: 21 hex) bounce.
+  const others = [randomUUID(), randomUUID().toUpperCase(), "0123456789abcdef01234"].map((id) =>
+    replyMessage(id, "other", RESPONSE_END)
+  );
+  for (const message of others) await receiver.handlers.processMessage(message);
+  assert.deepEqual(receiver.abandoned, others);
+  await client.close();
+});
+
+test("the warning about replies that are not this client's is rate-limited", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  const logged = [];
+  client.logger = silentLogger(logged);
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+  client.send({ name: "rpc" }, { body: 1 }).subscribe({ error: () => {} });
+  await ticks();
+  for (let i = 0; i < 10; i++) {
+    await sdk.receivers[0].handlers.processMessage(replyMessage(randomUUID(), "other", RESPONSE_END));
+    await sdk.receivers[0].handlers.processMessage(replyMessage(`junk-${i}`, "junk", RESPONSE_END));
+  }
+  assert.equal(sdk.receivers[0].abandoned.length, 10);
+  assert.equal(sdk.receivers[0].deadLettered.length, 10);
+  assert.equal(logged.filter((e) => e.level === "warn").length, 1);
+  await client.close();
+});
+
+test("values from a message are escaped in the logs (no forged log lines)", async () => {
+  const forged = "x\n[Nest] 1  - LOG [Fake] forged line";
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  const clientLogs = [];
+  client.logger = silentLogger(clientLogs);
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+  client.send({ name: "rpc" }, { body: 1 }).subscribe({ error: () => {} });
+  await ticks();
+  await sdk.receivers[0].handlers.processMessage(replyMessage(forged, "junk", RESPONSE_END));
+  await client.close();
+
+  const { server, receiver, logged: serverLogs } = await listeningWith(
+    async () => {
+      throw new Error("failed");
+    },
+    { receiveMode: "peekLock" },
+    { allowedReplyTo: ["rpc.reply"] }
+  );
+  await receiver.handlers.processMessage({ body: 1, messageId: forged, replyTo: forged });
+  await receiver.handlers.processMessage({ body: 1, messageId: forged });
+  await server.close();
+
+  const lines = [...clientLogs, ...serverLogs].map((e) => String(e.args[0]));
+  assert.ok(lines.length >= 3, JSON.stringify(lines));
+  for (const line of lines) assert.doesNotMatch(line, /\n/, line);
+  assert.ok(lines.some((line) => line.includes(JSON.stringify(forged))), JSON.stringify(lines));
+});
+
+// --- Who the server replies to (allowedReplyTo) -----------------------------
+
+test("by default the server replies to any replyTo (as 1.1.0)", async () => {
+  const { server, replies } = replyingServer(async () => "ok");
+  await server.handleMessage({ body: null, messageId: "m-1", replyTo: "anything" }, "rpc-pattern");
+  assert.equal(replies[0].entity, "anything");
+});
+
+test("allowedReplyTo: a request whose replyTo is not allowed gets no reply and is dead-lettered", async () => {
+  const calls = [];
+  const { server, receiver, logged, fake } = await listeningWith(
+    async (message) => {
+      calls.push(message);
+      return "ok";
+    },
+    { receiveMode: "peekLock" },
+    { allowedReplyTo: ["Orders.Reply"] }
+  );
+  const sent = [];
+  fake.client.createSender = (entity) => ({
+    sendMessages: async (messages) => sent.push({ entity, messages }),
+    close: async () => {},
+  });
+  server.sbClient = fake.client;
+
+  const allowed = { body: 1, messageId: "m-1", replyTo: "orders.reply" };
+  const denied = { body: 2, messageId: "m-2", replyTo: "billing-commands", replyToSessionId: "victim" };
+  await receiver.handlers.processMessage(allowed);
+  await receiver.handlers.processMessage(denied);
+
+  assert.deepEqual(calls, [allowed]);
+  assert.deepEqual(sent.map((s) => s.entity), ["orders.reply"]);
+  assert.deepEqual(receiver.completed, [allowed]);
+  assert.deepEqual(receiver.deadLettered.map((d) => d.message), [denied]);
+  assert.equal(receiver.deadLettered[0].options.deadLetterReason, "ReplyToNotAllowed");
+  const warning = logged.find((e) => e.level === "warn");
+  assert.match(String(warning.args[0]), /"billing-commands".*"victim".*not allowed/);
+  await server.close();
+});
+
+test("allowedReplyTo as a function, and a function that throws denies", async () => {
+  const seen = [];
+  const check = (replyTo, message) => {
+    seen.push([replyTo, message.messageId]);
+    if (replyTo === "boom") throw new Error("check failed");
+    return replyTo.startsWith("tenant-a.");
+  };
+  const { server, replies } = replyingServer(async () => "ok", { allowedReplyTo: check });
+  for (const replyTo of ["tenant-a.reply", "tenant-b.reply", "boom"]) {
+    await server.handleMessage({ body: null, messageId: replyTo, replyTo }, "rpc-pattern");
+  }
+  assert.deepEqual(replies.map((r) => r.entity), ["tenant-a.reply"]);
+  assert.deepEqual(seen.map(([replyTo]) => replyTo), ["tenant-a.reply", "tenant-b.reply", "boom"]);
+});
+
+test("allowedReplyTo copies the list it is given", async () => {
+  const list = ["a.reply"];
+  const { server, replies } = replyingServer(async () => "ok", { allowedReplyTo: list });
+  list.push("b.reply");
+  await server.handleMessage({ body: null, messageId: "m", replyTo: "b.reply" }, "rpc-pattern");
+  assert.deepEqual(replies, []);
+});
+
+// --- Streamed responses -----------------------------------------------------
+
+test("server sends a value as soon as it is emitted, even if the response never completes", async () => {
+  const { Observable } = require("rxjs");
+  const { server, replies } = replyingServer(
+    async () => new Observable((subscriber) => subscriber.next("first"))
+  );
+  server.handleMessage(requestFrom120(), "rpc-pattern");
+  await ticks();
+  assert.deepEqual(
+    replies.map((r) => [r.body, r.applicationProperties[SB_REPLY_TYPE_PROPERTY], r.applicationProperties[SB_REPLY_DISPOSED_PROPERTY]]),
+    [["first", "response", false]]
+  );
+});
+
+test("server streams progress values one by one and ends with a reply of its own", async () => {
+  const { Subject } = require("rxjs");
+  const progress = new Subject();
+  const { server, replies } = replyingServer(async () => progress);
+  server.handleMessage(requestFrom120(), "rpc-pattern");
+  await ticks();
+  const shape = () =>
+    replies.map((r) => [r.body, r.applicationProperties[SB_REPLY_TYPE_PROPERTY], r.applicationProperties[SB_REPLY_DISPOSED_PROPERTY]]);
+  for (const [i, value] of ["10%", "50%", "100%"].entries()) {
+    progress.next(value);
+    await ticks();
+    assert.equal(replies.length, i + 1, `"${value}" was not sent before the next value`);
+  }
+  progress.complete();
+  await ticks();
+  assert.deepEqual(shape(), [
+    ["10%", "response", false],
+    ["50%", "response", false],
+    ["100%", "response", false],
+    [undefined, "none", true],
+  ]);
+});
+
+test("server sends the error of a response after the values already sent", async () => {
+  const { Subject } = require("rxjs");
+  const values = new Subject();
+  const { server, replies } = replyingServer(async () => values);
+  server.handleMessage(requestFrom120(), "rpc-pattern");
+  await ticks();
+  values.next(1);
+  await ticks();
+  values.error({ status: "error", message: "late failure" });
+  await ticks();
+  assert.deepEqual(
+    replies.map((r) => [r.body, r.applicationProperties[SB_REPLY_TYPE_PROPERTY], r.applicationProperties[SB_REPLY_DISPOSED_PROPERTY]]),
+    [
+      [1, "response", false],
+      [{ status: "error", message: "late failure" }, "error", true],
+    ]
+  );
+});
+
+test("replyTimeToLiveInMs sets the time to live of the replies; none by default", async () => {
+  const withTtl = replyingServer(async () => "ok", { replyTimeToLiveInMs: 60_000 });
+  await withTtl.server.handleMessage({ body: null, messageId: "m", replyTo: "rpc.reply" }, "rpc-pattern");
+  assert.equal(withTtl.replies[0].timeToLive, 60_000);
+
+  const byDefault = replyingServer(async () => "ok");
+  await byDefault.server.handleMessage({ body: null, messageId: "m", replyTo: "rpc.reply" }, "rpc-pattern");
+  assert.equal("timeToLive" in byDefault.replies[0], false);
+});
+
+// --- Shutdown ---------------------------------------------------------------
+
+test("server close() stops waiting for handlers after closeTimeoutInMs and closes the receivers", async () => {
+  const { NEVER } = require("rxjs");
+  for (const handler of [async () => new Promise(() => {}), async () => NEVER]) {
+    const { server, receiver, logged, fake } = await listeningWith(
+      handler,
+      { receiveMode: "peekLock" },
+      { closeTimeoutInMs: 100 }
+    );
+    receiver.handlers.processMessage({ body: {}, messageId: "m-1" });
+    await ticks();
+    const started = Date.now();
+    const outcome = await Promise.race([
+      server.close().then(() => "closed"),
+      new Promise((resolve) => setTimeout(resolve, 3000, "still waiting").unref()),
+    ]);
+    assert.equal(outcome, "closed");
+    assert.ok(Date.now() - started >= 90);
+    assert.equal(receiver.closed, true);
+    assert.equal(fake.closed, true);
+    assert.deepEqual(receiver.completed, []);
+    assert.match(String(logged.find((e) => e.level === "warn")?.args[0]), /closeTimeoutInMs.*1 handler/);
+  }
+});
+
+test("server close() waits 30 s by default, and for ever with Infinity", () => {
+  assert.equal(new AzureServiceBusServer({ connectionString: CONNECTION_STRING }).closeTimeoutInMs, 30_000);
+  assert.equal(
+    new AzureServiceBusServer({ connectionString: CONNECTION_STRING, closeTimeoutInMs: Infinity }).closeTimeoutInMs,
+    Infinity
+  );
+});
+
+test("server close() leaves no timer behind when the handlers finish in time", async () => {
+  const { server, receiver } = await listeningWith(async () => {}, { receiveMode: "peekLock" }, {
+    closeTimeoutInMs: 60_000,
+  });
+  await receiver.handlers.processMessage({ body: {}, messageId: "m-1" });
+  const before = process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+  await server.close();
+  const after = process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+  assert.ok(after <= before, `${before} -> ${after}`);
+});
+
+// --- What util.inspect() shows ------------------------------------------------
+
+test("util.inspect() of the client and the server does not show the connection string's key", async () => {
+  const util = require("node:util");
+  const secret = "c2VjcmV0LWtleS10aGF0LW11c3Qtbm90LWxlYWs=";
+  // .invalid never resolves; nothing here connects anyway.
+  const connectionString = `Endpoint=sb://example.invalid/;SharedAccessKeyName=app;SharedAccessKey=${secret}`;
+  const { ServiceBusClient } = require("@azure/service-bus");
+  // A connected-looking client: an SDK client (it holds the key) and a
+  // request waiting on a reply receiver.
+  const client = new AzureServiceBusClient({ connectionString });
+  client.logger = silentLogger();
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+  client.send({ name: "rpc" }, { body: 1 }).subscribe({ error: () => {} });
+  await ticks();
+  sdk.receivers[0].credentials = new ServiceBusClient(connectionString);
+  client.sbClient = new ServiceBusClient(connectionString);
+  const server = new AzureServiceBusServer({ connectionString });
+  server.sbClient = new ServiceBusClient(connectionString);
+  for (const target of [client, server]) {
+    for (const depth of [2, Infinity]) {
+      const shown = util.inspect(target, { depth, showHidden: false });
+      assert.ok(!shown.includes(secret), shown);
+      assert.match(shown, /SharedAccessKey=<redacted>/);
+      assert.match(shown, /SharedAccessKeyName=app/);
+    }
+    assert.ok(!require("node:util").format("%o", target).includes(secret));
+    // The code (and subclasses) still read the real options.
+    assert.equal(target.options.connectionString, connectionString);
+  }
+  class MyServer extends AzureServiceBusServer {
+    connection() {
+      return this.options.connectionString;
+    }
+  }
+  const mine = new MyServer({ connectionString });
+  assert.equal(mine.connection(), connectionString);
+  assert.match(util.inspect(mine), /^MyServer /);
+  assert.match(util.inspect(client), /ReplyRouter \{ waiting: \{ "rpc.reply": 1 \}/);
+  client.sbClient = sdk;
+  await client.close();
+  await server.sbClient.close();
+});
+
+test("a streamed request is completed once its first reply is out, and close() waits for the rest", async () => {
+  const { Subject } = require("rxjs");
+  const values = new Subject();
+  const { server, receiver } = await listeningWith(async () => values, { receiveMode: "peekLock" });
+  const replies = [];
+  server.sbClient = {
+    ...server.sbClient,
+    createSender: () => ({ sendMessages: async (m) => replies.push(...m), close: async () => {} }),
+  };
+  const request = requestFrom120();
+  const processing = receiver.handlers.processMessage(request);
+  await ticks();
+  assert.deepEqual(receiver.completed, [], "completed before any reply");
+  values.next("first");
+  await processing; // the receiver can take the next message
+  assert.deepEqual(receiver.completed, [request]);
+
+  let closed = false;
+  const closing = server.close().then(() => (closed = true));
+  await ticks();
+  assert.equal(closed, false, "close() did not wait for the rest of the response");
+  values.next("second");
+  values.complete();
+  await closing;
+  // "second" and the end came in the same tick: one reply.
+  assert.deepEqual(replyShape(replies), [
+    ["first", "response", false],
+    ["second", "response", true],
+  ]);
 });

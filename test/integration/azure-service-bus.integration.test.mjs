@@ -350,10 +350,14 @@ describe(
     });
 
     test("send() to an entity that does not exist errors the Observable", async () => {
+      // itest.nosend does not exist, but its reply queue does: the error can
+      // only come from the send itself.
       const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+      const logger = captureLogger();
+      client.logger = logger;
       try {
         const outcome = await Promise.race([
-          firstValueFrom(client.send({ name: "itest.does-not-exist" }, { body: { runId } })).then(
+          firstValueFrom(client.send({ name: "itest.nosend" }, { body: { runId } })).then(
             (value) => ({ value }),
             (error) => ({ error })
           ),
@@ -362,6 +366,12 @@ describe(
         assert.notEqual(outcome, "timeout", "send() neither replied nor failed");
         assert.ok(outcome.error, `expected an error, got ${JSON.stringify(outcome)}`);
         assert.equal(outcome.error.code, "MessagingEntityNotFound");
+        assert.match(String(outcome.error.message), /itest\.nosend/);
+        // The reply receiver did not fail: nothing about the reply queue.
+        assert.deepEqual(
+          logger.errors().filter((e) => /reply/i.test(String(e.message))),
+          []
+        );
       } finally {
         await client.close();
       }
@@ -613,6 +623,307 @@ describe(
         const closing = app.close();
         const timeout = timeoutAfter(10_000);
         assert.notEqual(await Promise.race([closing, timeout]), "timeout");
+      }
+    });
+
+    test("send() without replySessions fails fast on a reply queue with sessions", async () => {
+      // itest.rpc.sessions.reply requires sessions: a receiver without them
+      // gets a non-retryable error, which the SDK would retry for ever.
+      const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+      const logger = captureLogger();
+      client.logger = logger;
+      try {
+        const started = Date.now();
+        const outcome = await outcomeOf(
+          client.send({ name: "itest.rpc.sessions" }, { body: { runId, n: -1 } }),
+          20_000
+        );
+        assert.notEqual(outcome, "timeout", "send() kept waiting on a receiver that cannot work");
+        assert.equal(outcome.error?.retryable, false, String(outcome.error));
+        assert.match(String(outcome.error?.message), /requires sessions/);
+        assert.ok(Date.now() - started < 10_000, `took ${Date.now() - started} ms`);
+        assert.match(String(logger.errors()[0]?.message), /must not have sessions enabled/);
+      } finally {
+        await client.close();
+        await drain("itest.rpc.sessions");
+      }
+    });
+
+    test("allowedReplyTo: the server does not reply to a replyTo it does not allow", async () => {
+      const calls = [];
+      const controller = defineController({
+        echo: {
+          decorator: Queue({ queueName: "itest.guarded", receiveMode: "peekLock" }),
+          fn: (message) => {
+            calls.push(message.body);
+            return { echoed: message.body };
+          },
+        },
+      });
+      const logger = captureLogger();
+      const strategy = new AzureServiceBusServer({
+        connectionString: CONNECTION_STRING,
+        allowedReplyTo: ["itest.guarded.reply"],
+      });
+      const { app } = await startMicroservice(controller, { logger, strategy });
+      const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+      client.logger = captureLogger();
+      try {
+        // A request that names another entity as its reply queue.
+        await sendRaw("itest.guarded", { runId, kind: "redirect" }, {
+          replyTo: "itest.forbidden",
+          messageId: `redirect-${runId}`,
+        });
+        // A legitimate one still gets its reply.
+        const outcome = await outcomeOf(
+          client.send({ name: "itest.guarded" }, { body: { runId, kind: "legit" } }),
+          20_000
+        );
+        assert.deepEqual(outcome.value, { echoed: { runId, kind: "legit" } });
+        const dead = await withSdk(async (sdk) => {
+          const dlq = sdk.createReceiver("itest.guarded", {
+            subQueueType: "deadLetter",
+            receiveMode: "receiveAndDelete",
+          });
+          const got = await dlq.receiveMessages(10, { maxWaitTimeInMs: 5_000 });
+          await dlq.close();
+          return got.filter((m) => m.body?.runId === runId);
+        });
+        assert.equal(dead.length, 1);
+        assert.equal(dead[0].body.kind, "redirect");
+        assert.equal(dead[0].deadLetterReason, "ReplyToNotAllowed");
+        assert.deepEqual(calls, [{ runId, kind: "legit" }], "the handler ran for the rejected request");
+        assert.match(
+          String(logger.entries.find((e) => e.level === "warn")?.message),
+          /"itest\.forbidden" is not allowed/
+        );
+      } finally {
+        await client.close();
+        await app.close();
+      }
+      // Nothing was sent to the entity the request named.
+      const forbidden = await withSdk(async (sdk) => {
+        const receiver = sdk.createReceiver("itest.forbidden", { receiveMode: "receiveAndDelete" });
+        const got = await receiver.receiveMessages(10, { maxWaitTimeInMs: 2_000 });
+        await receiver.close();
+        return got;
+      });
+      assert.deepEqual(forbidden, []);
+    });
+
+    /** A @Queue handler on itest.stream whose response is chosen by the request. */
+    function streamController() {
+      const { Observable } = require("rxjs");
+      return defineController({
+        stream: {
+          decorator: Queue({ queueName: "itest.stream", receiveMode: "peekLock" }),
+          fn: (message) =>
+            new Observable((subscriber) => {
+              if (message.body.kind === "progress") {
+                const steps = ["10%", "50%", "100%"];
+                const timers = steps.map((step, i) =>
+                  setTimeout(() => {
+                    subscriber.next(step);
+                    if (i === steps.length - 1) subscriber.complete();
+                  }, 300 * i)
+                );
+                return () => timers.forEach(clearTimeout);
+              }
+              // Emits once and never completes.
+              subscriber.next("started");
+              return undefined;
+            }),
+        },
+      });
+    }
+
+    test("streamed responses: each value is sent as soon as it is emitted", async () => {
+      const { toArray } = require("rxjs");
+      const strategy = new AzureServiceBusServer({
+        connectionString: CONNECTION_STRING,
+        closeTimeoutInMs: 1_000,
+      });
+      const { app } = await startMicroservice(streamController(), { strategy });
+      const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+      client.logger = captureLogger();
+      try {
+        const all = await outcomeOf(
+          client.send({ name: "itest.stream" }, { body: { runId, kind: "progress" } }).pipe(toArray()),
+          20_000
+        );
+        assert.deepEqual(all.value, ["10%", "50%", "100%"]);
+        // A response that never completes still delivers its first value.
+        const first = await outcomeOf(
+          // Short-lived: closing the server leaves it locked, and it must not
+          // reach the handler again in a later test or run.
+          client.send({ name: "itest.stream" }, { body: { runId, kind: "endless" }, timeToLive: 5_000 }),
+          10_000
+        );
+        assert.notEqual(first, "timeout", "the value of an endless response was held back");
+        assert.equal(first.value, "started");
+        // The endless response does not hold the receiver (one call at a
+        // time by default): the next request is answered.
+        const next = await outcomeOf(
+          client.send({ name: "itest.stream" }, { body: { runId, kind: "progress" } }).pipe(toArray()),
+          10_000
+        );
+        assert.deepEqual(next.value, ["10%", "50%", "100%"]);
+      } finally {
+        await client.close();
+        await app.close(); // the endless handler is cut by closeTimeoutInMs
+        await drain("itest.stream");
+        await drain("itest.stream.reply");
+      }
+    });
+
+    test("replyTimeToLiveInMs sets the time to live of the replies", async () => {
+      const strategy = new AzureServiceBusServer({
+        connectionString: CONNECTION_STRING,
+        replyTimeToLiveInMs: 120_000,
+      });
+      const { app } = await startMicroservice(streamController(), { strategy });
+      try {
+        const replies = await withSdk(async (sdk) => {
+          const receiver = sdk.createReceiver("itest.stream.reply", { receiveMode: "receiveAndDelete" });
+          const sender = sdk.createSender("itest.stream");
+          await sender.sendMessages({
+            body: { runId, kind: "progress" },
+            messageId: `ttl-${runId}`,
+            replyTo: "itest.stream.reply",
+          });
+          await sender.close();
+          const got = [];
+          for (let i = 0; i < 20 && got.length < 3; i++) {
+            const batch = await receiver.receiveMessages(3, { maxWaitTimeInMs: 1_000 });
+            got.push(...batch.filter((m) => m.correlationId === `ttl-${runId}`));
+          }
+          await receiver.close();
+          return got;
+        });
+        // Three values; the end comes in the same tick as the last one, on it.
+        assert.deepEqual(
+          replies.map((r) => [r.body, r.applicationProperties["nestjs-sb-is-disposed"]]),
+          [
+            ["10%", false],
+            ["50%", false],
+            ["100%", true],
+          ]
+        );
+        for (const reply of replies) assert.equal(reply.timeToLive, 120_000);
+      } finally {
+        await app.close();
+      }
+    });
+
+    test("close() stops waiting after closeTimeoutInMs; the message comes back", async () => {
+      // itest.closetimeout has a 5 s lock.
+      const started = deferred("the handler to start");
+      const controller = defineController({
+        stuck: {
+          decorator: Queue({ queueName: "itest.closetimeout", receiveMode: "peekLock" }),
+          fn: (message) => {
+            if (message.body?.runId !== runId) return undefined;
+            started.resolve(message.deliveryCount);
+            return new Promise(() => {}); // never settles
+          },
+        },
+      });
+      const logger = captureLogger();
+      const strategy = new AzureServiceBusServer({
+        connectionString: CONNECTION_STRING,
+        closeTimeoutInMs: 1_000,
+      });
+      const { app } = await startMicroservice(controller, { logger, strategy });
+      await sendRaw("itest.closetimeout", { runId, kind: "stuck" });
+      const firstDelivery = await started.promise;
+      const closing = Date.now();
+      assert.notEqual(await Promise.race([app.close(), timeoutAfter(10_000)]), "timeout");
+      assert.ok(Date.now() - closing < 8_000, `close() took ${Date.now() - closing} ms`);
+      assert.match(
+        String(logger.entries.find((e) => e.level === "warn")?.message),
+        /closeTimeoutInMs/
+      );
+      // Not settled: delivered again once the lock expires.
+      const again = await withSdk(async (sdk) => {
+        const receiver = sdk.createReceiver("itest.closetimeout");
+        for (let i = 0; i < 20; i++) {
+          const [message] = await receiver.receiveMessages(1, { maxWaitTimeInMs: 1_000 });
+          if (message?.body?.runId === runId) {
+            await receiver.completeMessage(message);
+            await receiver.close();
+            return message;
+          }
+          if (message) await receiver.completeMessage(message);
+        }
+        await receiver.close();
+        return undefined;
+      });
+      assert.ok(again, "the message was not delivered again");
+      assert.equal(again.deliveryCount, firstDelivery + 1);
+    });
+
+    test("a reply that is not to a request is dead-lettered, not bounced", async () => {
+      const client = new AzureServiceBusClient({
+        connectionString: CONNECTION_STRING,
+        replyTimeoutInMs: 15_000,
+      });
+      const logger = captureLogger();
+      client.logger = logger;
+      // Nobody answers itest.junk: the request only keeps a reply receiver open.
+      const pending = outcomeOf(client.send({ name: "itest.junk" }, { body: { runId } }), 20_000);
+      try {
+        await delay(1_500);
+        await sendRaw("itest.junk.reply", { runId, kind: "junk" }, { correlationId: `junk-${runId}` });
+        const dead = await withSdk(async (sdk) => {
+          const dlq = sdk.createReceiver("itest.junk.reply", {
+            subQueueType: "deadLetter",
+            receiveMode: "receiveAndDelete",
+          });
+          const got = [];
+          for (let i = 0; i < 10 && got.length === 0; i++) {
+            got.push(
+              ...(await dlq.receiveMessages(10, { maxWaitTimeInMs: 1_000 })).filter(
+                (m) => m.body?.runId === runId
+              )
+            );
+          }
+          await dlq.close();
+          return got;
+        });
+        assert.equal(dead.length, 1);
+        assert.equal(dead[0].deadLetterReason, "InvalidCorrelationId");
+        assert.ok(dead[0].deliveryCount <= 1, `delivered ${dead[0].deliveryCount} times`);
+        assert.equal(
+          logger.entries.filter((e) => /Dead-lettered a reply/.test(String(e.message))).length,
+          1
+        );
+      } finally {
+        await client.close();
+        await pending;
+        await drain("itest.junk");
+      }
+    });
+
+    test("util.inspect() of a connected client and server hides the key", async () => {
+      const { inspect } = require("node:util");
+      const key = /SharedAccessKey=([^;]+)/.exec(CONNECTION_STRING)[1];
+      const { app, server } = await startMicroservice(echoController("itest.rpc"));
+      const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+      client.logger = captureLogger();
+      try {
+        const reply = await outcomeOf(
+          client.send({ name: "itest.rpc" }, { body: { n: 1, runId } }),
+          20_000
+        );
+        assert.equal(reply.value?.n, 1);
+        for (const target of [client, server]) {
+          const shown = inspect(target, { depth: Infinity });
+          assert.ok(!shown.includes(key), "the key is shown");
+          assert.match(shown, /SharedAccessKey=<redacted>/);
+        }
+      } finally {
+        await client.close();
+        await app.close();
       }
     });
 

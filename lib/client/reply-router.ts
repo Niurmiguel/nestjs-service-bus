@@ -7,6 +7,9 @@ import {
   ServiceBusReceiver,
 } from "@azure/service-bus";
 import { LoggerService } from "@nestjs/common";
+import { inspect } from "util";
+
+import { quote, RateLimitedWarning } from "../utils";
 
 /** A request waiting for its reply. */
 export interface ReplyWaiter {
@@ -17,14 +20,26 @@ export interface ReplyWaiter {
 }
 
 /**
- * Receive errors that retrying does not fix. The requests waiting on that
- * receiver fail instead of waiting forever.
+ * Receive errors that retrying does not fix, besides those the SDK marks as
+ * not retryable. The requests waiting on that receiver fail instead of
+ * waiting forever (the SDK would retry them forever).
  */
 const FATAL_RECEIVE_ERRORS = new Set([
   "MessagingEntityNotFound",
   "SessionCannotBeLocked",
   "SessionLockLost",
 ]);
+
+/**
+ * The shape of a request id: a UUID (clients since 1.2.0, and NestJS 11.2.8+)
+ * or the 21 hexadecimal characters of NestJS 10's ids (clients 1.1.0). A reply
+ * whose `correlationId` has neither shape belongs to no client.
+ */
+const REQUEST_ID_SHAPE =
+  /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{21})$/i;
+
+/** How often the warning about replies that are not this client's is logged. */
+const FOREIGN_REPLY_WARNING_INTERVAL_MS = 60_000;
 
 /**
  * How long the SDK keeps renewing the lock of a reply session. The receiver is
@@ -89,6 +104,9 @@ export class ReplyRouter {
   /** Receivers being closed, by queue: a new one on the same session waits. */
   private readonly closing = new Map<string, Promise<void>>();
   private readonly finished = new RecentIds(FINISHED_IDS_LIMIT);
+  private readonly foreignReplyWarning = new RateLimitedWarning(
+    FOREIGN_REPLY_WARNING_INTERVAL_MS
+  );
 
   constructor(
     private readonly getClient: () => ServiceBusClient,
@@ -111,6 +129,16 @@ export class ReplyRouter {
     }
     listener.waiters.set(id, waiter);
     return () => this.stopWaiting(listener, id);
+  }
+
+  /** A summary for `util.inspect()`: no SDK objects (they hold the credentials). */
+  [inspect.custom](): string {
+    const waiting = [...this.listeners.values()].map(
+      ({ replyTo, waiters }) => `${quote(replyTo)}: ${waiters.size}`
+    );
+    return `ReplyRouter { waiting: { ${waiting.join(", ")} }${
+      this.sessionId ? `, sessionId: ${quote(this.sessionId)}` : ""
+    } }`;
   }
 
   /** Fails every request still waiting with `reason` and closes the receivers. */
@@ -170,7 +198,7 @@ export class ReplyRouter {
         return; // Closed while opening.
       }
       this.logger().error(
-        `Could not receive the replies on "${replyTo}"${
+        `Could not receive the replies on ${quote(replyTo)}${
           this.sessionId ? " (with replySessions the reply queue must have sessions enabled)" : ""
         }: ${err?.message ?? err}`,
         err?.stack
@@ -193,13 +221,29 @@ export class ReplyRouter {
           (id !== undefined && listener.waiters.has(id)) ||
           this.finished.has(id);
         if (!isOwn) {
+          if (id === undefined || !REQUEST_ID_SHAPE.test(id)) {
+            // No client sent that id: bouncing it would only delay the
+            // dead-letter queue by the max delivery count.
+            await receiver.deadLetterMessage(message, {
+              deadLetterReason: "InvalidCorrelationId",
+              deadLetterErrorDescription:
+                "The correlationId of this reply is not the id of a request.",
+            });
+            this.foreignReplyWarning.emit(
+              (text) => this.logger().warn(text),
+              `Dead-lettered a reply on ${quote(replyTo)} whose correlationId ` +
+                `${quote(message.correlationId)} is not a request id`
+            );
+            return;
+          }
           // Another client's reply: give it back to the queue for that client.
-          this.logger().warn(
-            `Abandoned a reply on "${replyTo}" to a request this client did not send ` +
-              `(correlationId ${String(message.correlationId)}). If several clients ` +
+          await receiver.abandonMessage(message);
+          this.foreignReplyWarning.emit(
+            (text) => this.logger().warn(text),
+            `Abandoned a reply on ${quote(replyTo)} to a request this client did not send ` +
+              `(correlationId ${quote(message.correlationId)}). If several clients ` +
               "send to the same entity, enable replySessions so each gets only its replies."
           );
-          await receiver.abandonMessage(message);
           return;
         }
         // A rejection here (e.g. the lock was lost) makes the SDK abandon it,
@@ -211,9 +255,8 @@ export class ReplyRouter {
           waiter.reply(message);
         } else {
           this.logger().debug?.(
-            `Dropped a reply on "${replyTo}" to a request that no longer waits (correlationId ${String(
-              message.correlationId
-            )})`
+            `Dropped a reply on ${quote(replyTo)} to a request that no longer waits ` +
+              `(correlationId ${quote(message.correlationId)})`
           );
         }
       },
@@ -224,13 +267,28 @@ export class ReplyRouter {
           return;
         }
         const err = error as Error | undefined;
+        // Only the receive link itself: an error of this router's own
+        // callback (e.g. a lost message lock while completing a reply) is
+        // retried by the SDK, and does not concern the other requests.
+        const fatal =
+          errorSource === "receive" &&
+          isServiceBusError(err) &&
+          (FATAL_RECEIVE_ERRORS.has(err.code) || err.retryable === false);
         this.logger().error(
-          `Azure Service Bus ${errorSource} error on the reply queue "${entityPath}": ${
+          `Azure Service Bus ${errorSource} error on the reply queue ${quote(entityPath)}: ${
             err?.message ?? err
+          }${
+            fatal
+              ? `. The requests waiting for a reply there fail${
+                  this.sessionId
+                    ? " (with replySessions the reply queue must have sessions enabled)"
+                    : " (without replySessions the reply queue must not have sessions enabled)"
+                }.`
+              : ""
           }`,
           err?.stack
         );
-        if (isServiceBusError(err) && FATAL_RECEIVE_ERRORS.has(err.code)) {
+        if (fatal) {
           this.failAll(listener, err);
         }
       },
@@ -264,7 +322,7 @@ export class ReplyRouter {
     })()
       .catch((err) =>
         this.logger().error(
-          `Could not close the reply receiver on "${replyTo}": ${err?.message ?? err}`,
+          `Could not close the reply receiver on ${quote(replyTo)}: ${err?.message ?? err}`,
           err?.stack
         )
       )

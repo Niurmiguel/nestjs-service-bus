@@ -9,7 +9,7 @@ import { BaseRpcContext } from "@nestjs/microservices/ctx-host/base-rpc.context"
  * AzureServiceBusContext([])`, the only form before they were added, still
  * compiles.
  */
-type AzureServiceBusContextArgs = [ServiceBusReceiver?, ServiceBusReceivedMessage?];
+export type AzureServiceBusContextArgs = [ServiceBusReceiver?, ServiceBusReceivedMessage?];
 
 export class AzureServiceBusContext extends BaseRpcContext<AzureServiceBusContextArgs> {
   constructor(args: AzureServiceBusContextArgs) {

@@ -221,3 +221,12 @@ test(
     assert.equal(closed, false);
   }
 );
+
+test("the context exposes the receiver and the message", () => {
+  const receiver = {};
+  const message = {};
+  const ctx = new AzureServiceBusContext([receiver, message]);
+  assert.equal(ctx.getReceiver(), receiver);
+  assert.equal(ctx.getMessage(), message);
+  assert.equal(ctx.getArgs()[0], receiver);
+});

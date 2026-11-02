@@ -35,6 +35,9 @@ jobs:
           NEST: ${{ matrix.nest != '11' && format('@nestjs/common@^{0} @nestjs/core@^{0} @nestjs/microservices@^{0}', matrix.nest) || '' }}
       # npm test compiles against the installed versions, then runs the tests.
       - run: npm test
+      # Fails if the package would publish tests, CI files, the emulator
+      # setup or configs, or source maps pointing to unpublished files.
+      - run: npm run check:pack
 
   integration:
     name: Emulator / NestJS ${{ matrix.nest }} / service-bus ${{ matrix.service-bus }}

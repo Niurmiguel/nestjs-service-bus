@@ -4,11 +4,17 @@
   "description": "NestJS Azure Service Bus Microservice Transport",
   "main": "dist/index",
   "types": "dist/index",
+  "files": [
+    "dist",
+    "lib",
+    "CHANGELOG.md"
+  ],
   "scripts": {
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
     "prepack": "npm run build",
     "test": "npm run build && node --test --test-timeout=10000 test/azure-service-bus.test.js",
-    "test:integration": "npm run build && node --test --test-force-exit --test-timeout=60000 test/integration/azure-service-bus.integration.test.mjs"
+    "test:integration": "npm run build && node --test --test-force-exit --test-timeout=60000 test/integration/azure-service-bus.integration.test.mjs",
+    "check:pack": "npm run build && node scripts/check-pack.mjs"
   },
   "repository": {
     "type": "git",

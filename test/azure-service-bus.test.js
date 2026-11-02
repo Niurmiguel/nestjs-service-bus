@@ -540,6 +540,25 @@ test("send() follows a streamed reply: values, an undefined value and the end", 
   assert.deepEqual(empty.events, [["complete"]]);
 });
 
+test("send() fails with the error a server replies with", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  client.logger = silentLogger();
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+
+  const a = collect(client.send({ name: "rpc" }, { body: 1 }));
+  await ticks();
+  const error = { status: "error", message: "Internal server error" };
+  await sdk.receivers[0].handlers.processMessage(
+    replyMessage(requestIdOf(sdk.senders[0]), error, {
+      [SB_REPLY_TYPE_PROPERTY]: "error",
+      [SB_REPLY_DISPOSED_PROPERTY]: true,
+    })
+  );
+  await a.done;
+  assert.deepEqual(a.events, [["error", error]]);
+});
+
 test("send() with replySessions receives its replies in its own session", async () => {
   const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING, replySessions: true });
   const other = new AzureServiceBusClient({ connectionString: CONNECTION_STRING, replySessions: true });
@@ -725,6 +744,46 @@ test("server logs a reply it cannot send, even in the middle of a long response"
   assert.deepEqual(unhandled, []);
   assert.equal(logged.filter((e) => e.level === "error").length, 1);
   assert.match(String(logged[0].args[0]), /Could not send the reply to "rpc.reply": reply queue is gone/);
+});
+
+test("server replies with the error when a request handler fails", async () => {
+  const { of, concat, throwError } = require("rxjs");
+  // What Nest's exception filter returns: an Observable that errors with a
+  // client-safe object (no stack).
+  const filtered = { status: "error", message: "Internal server error" };
+  const { server, replies } = replyingServer(async () => concat(of(1), throwError(() => filtered)));
+
+  await server.handleMessage({ body: null, messageId: "m-1", replyTo: "rpc.reply" }, "rpc-pattern");
+
+  assert.deepEqual(
+    replies.map((r) => [r.body, r.applicationProperties[SB_REPLY_TYPE_PROPERTY], r.applicationProperties[SB_REPLY_DISPOSED_PROPERTY]]),
+    [
+      [1, "response", false],
+      [filtered, "error", true],
+    ]
+  );
+});
+
+test("server replies with a generic error, and logs it, when an Error bypasses Nest's filter", async () => {
+  const logged = [];
+  const { server, replies } = replyingServer(async () => {
+    throw new TypeError("secret detail at /srv/app/handler.js:12");
+  });
+  server.logger = silentLogger(logged);
+
+  await server.handleMessage({ body: null, messageId: "m-1", replyTo: "rpc.reply" }, "rpc-pattern");
+
+  assert.equal(replies.length, 1);
+  assert.deepEqual(replies[0].body, { status: "error", message: "Internal server error" });
+  assert.equal(replies[0].applicationProperties[SB_REPLY_TYPE_PROPERTY], "error");
+  assert.ok(!JSON.stringify(replies[0]).includes("secret"));
+  assert.match(String(logged.find((e) => e.level === "error")?.args[0]), /secret detail/);
+});
+
+test("server replies with an error when no handler matches the request", async () => {
+  const { server, replies } = replyingServer(async () => 1);
+  await server.handleMessage({ body: null, messageId: "m-1", replyTo: "rpc.reply" }, "unknown-pattern");
+  assert.equal(replies[0].applicationProperties[SB_REPLY_TYPE_PROPERTY], "error");
 });
 
 test("server.unwrap throws before listen", () => {

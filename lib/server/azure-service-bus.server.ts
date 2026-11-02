@@ -14,7 +14,7 @@ import {
   ServiceBusReceiver,
   ServiceBusReceiverOptions,
 } from "@azure/service-bus";
-import { finalize, isObservable, lastValueFrom, Observable } from "rxjs";
+import { finalize, isObservable, lastValueFrom, Observable, throwError } from "rxjs";
 
 import {
   SB_REPLY_DISPOSED_PROPERTY,
@@ -55,6 +55,9 @@ interface ProcessingHooks {
   ) => unknown;
   onProcessingEndHook?: (transportId: unknown, context: unknown) => void;
 }
+
+/** What Nest's own exception filter sends for an unknown error. */
+const UNKNOWN_EXCEPTION = { status: "error", message: "Internal server error" };
 
 /** A short description of what a handler failed with, for the logs. */
 function describeError(err: unknown): string {
@@ -293,13 +296,18 @@ export class AzureServiceBusServer
       return this.handleEvent(packet.pattern, packet, sbContext);
     }
 
-    const handler = this.getHandlerByPattern(pattern);
-    const response$ = this.transformToObservable(
-      await handler(receivedMessage, sbContext)
-    );
-    if (response$) {
-      await this.sendReply(response$, receivedMessage);
+    // Whatever goes wrong, the client gets a reply: an error, not silence.
+    let response$: Observable<unknown>;
+    try {
+      const handler = this.getHandlerByPattern(pattern);
+      if (!handler) {
+        throw new Error(`There is no handler for the request pattern ${pattern}`);
+      }
+      response$ = this.transformToObservable(await handler(receivedMessage, sbContext));
+    } catch (err) {
+      response$ = throwError(() => err);
     }
+    await this.sendReply(response$, receivedMessage);
   }
 
   /**
@@ -449,11 +457,7 @@ export class AzureServiceBusServer
         },
         error: (err) => {
           if (last) respond(last);
-          this.logger.error(
-            `The handler of a request on "${replyTo}" failed; no reply was sent: ${
-              (err as Error)?.message ?? JSON.stringify(err)
-            }`
-          );
+          respond({ err: this.toReplyError(err, request), isDisposed: true });
           resolve();
         },
         complete: () => {
@@ -471,6 +475,25 @@ export class AzureServiceBusServer
         err?.stack
       );
     }
+  }
+
+  /**
+   * What the client gets when the handler of its request fails. Nest's
+   * exception filter has already turned a handler's exception into a
+   * client-safe value (`{ status: "error", message }`, or the payload of an
+   * `RpcException`), which goes as is, as in Nest's other transports. An
+   * `Error` that did not go through the filter (e.g. the handler could not be
+   * found) is logged here and replaced, so no stack or internal message leaks.
+   */
+  private toReplyError(err: unknown, request: ServiceBusReceivedMessage): unknown {
+    if (err instanceof Error || err === undefined || err === null) {
+      this.logger.error(
+        `The request ${request.messageId} on "${request.replyTo}" failed: ${describeError(err)}`,
+        (err as Error)?.stack
+      );
+      return { ...UNKNOWN_EXCEPTION };
+    }
+    return err;
   }
 
   private parsePattern(pattern: string): SubscriberPattern {

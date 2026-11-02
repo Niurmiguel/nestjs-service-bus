@@ -19,6 +19,7 @@ import { fileURLToPath } from "node:url";
 const require = createRequire(import.meta.url);
 const { ServiceBusClient } = require("@azure/service-bus");
 const { firstValueFrom } = require("rxjs");
+const { RpcException } = require("@nestjs/microservices");
 const nestVersion = require("@nestjs/microservices/package.json").version;
 const {
   AzureServiceBusClient,
@@ -280,6 +281,37 @@ describe(
         await client.close();
         await app.close();
       }
+    });
+
+    test("send() fails with the error of a request handler that throws", async () => {
+      const controller = defineController({
+        fail: {
+          decorator: Queue({ queueName: "itest.rpc", receiveMode: "peekLock" }),
+          fn: async (message) => {
+            if (message.body.kind === "rpc-exception") throw new RpcException("Order 7 not found");
+            throw new Error("internal detail that must not reach the client");
+          },
+        },
+      });
+      const { app } = await startMicroservice(controller);
+      const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+      client.logger = captureLogger();
+      try {
+        const [unknown, rpc] = await Promise.all(
+          ["error", "rpc-exception"].map((kind) =>
+            outcomeOf(client.send({ name: "itest.rpc" }, { body: { runId, kind } }), 20_000)
+          )
+        );
+        assert.notEqual(unknown, "timeout", "send() waited forever for a handler that threw");
+        // As Nest's other transports: unknown errors are replaced, RpcException goes through.
+        assert.deepEqual(unknown.error, { status: "error", message: "Internal server error" });
+        assert.deepEqual(rpc.error, { status: "error", message: "Order 7 not found" });
+      } finally {
+        await client.close();
+        await app.close();
+      }
+      // The requests were answered, so they were completed, not redelivered.
+      assert.deepEqual(await remaining("itest.rpc"), []);
     });
 
     test("replySessions: clients sharing a reply queue each get only their replies", async () => {

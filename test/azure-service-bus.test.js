@@ -952,6 +952,82 @@ test("server completes peekLock messages after the handler unless told not to", 
   }
 });
 
+/**
+ * Listens with one @Queue handler and returns the fake receiver, with the
+ * settlements it gets recorded.
+ */
+async function listeningWith(handler, metaOptions) {
+  const fake = fakeServiceBusClient();
+  const logged = [];
+  const server = new AzureServiceBusServer({ connectionString: CONNECTION_STRING });
+  server.logger = silentLogger(logged);
+  server.createServiceBusClient = () => fake.client;
+  server.addHandler({ type: "queue", metaOptions: { queueName: "q", ...metaOptions } }, handler, true);
+  await listen(server);
+  const receiver = fake.receivers[0];
+  receiver.completed = [];
+  receiver.abandoned = [];
+  receiver.completeMessage = async (message) => receiver.completed.push(message);
+  receiver.abandonMessage = async (message) => receiver.abandoned.push(message);
+  return { server, receiver, logged };
+}
+
+test("an event handler that throws gets its peekLock message abandoned, not completed", async () => {
+  const { throwError } = require("rxjs");
+  const failures = [
+    async () => {
+      throw new Error("handler failed");
+    },
+    // What Nest's exception filter returns for an error thrown in a handler.
+    async () => throwError(() => ({ status: "error", message: "Internal server error" })),
+  ];
+  for (const handler of failures) {
+    const { server, receiver, logged } = await listeningWith(handler, { receiveMode: "peekLock" });
+    const message = { body: {}, messageId: "m-1" };
+    await receiver.handlers.processMessage(message);
+    assert.deepEqual(receiver.abandoned, [message]);
+    assert.deepEqual(receiver.completed, []);
+    assert.match(String(logged.find((e) => e.level === "warn")?.args[0]), /m-1.*abandoned/);
+    await server.close();
+  }
+});
+
+test("an event handler error abandons nothing in receiveAndDelete or once the handler settled", async () => {
+  const fail = async () => {
+    throw new Error("handler failed");
+  };
+  const deleted = await listeningWith(fail, { receiveMode: "receiveAndDelete" });
+  deleted.receiver.receiveMode = "receiveAndDelete";
+  await deleted.receiver.handlers.processMessage({ body: {}, messageId: "m-1" });
+  assert.deepEqual(deleted.receiver.abandoned, []);
+  assert.match(String(deleted.logged.find((e) => e.level === "error")?.args[0]), /m-1/);
+  await deleted.server.close();
+
+  const settled = await listeningWith(fail, { receiveMode: "peekLock" });
+  await settled.receiver.handlers.processMessage({
+    body: {},
+    messageId: "m-2",
+    delivery: { remote_settled: true }, // e.g. the handler dead-lettered it, then threw
+  });
+  assert.deepEqual(settled.receiver.abandoned, []);
+  assert.deepEqual(settled.receiver.completed, []);
+  await settled.server.close();
+});
+
+test("the message is completed only once the handler's Observable completes", async () => {
+  const { Subject } = require("rxjs");
+  const work = new Subject();
+  const { server, receiver } = await listeningWith(async () => work, { receiveMode: "peekLock" });
+  const processing = receiver.handlers.processMessage({ body: {}, messageId: "m-1" });
+  await ticks();
+  assert.deepEqual(receiver.completed, []);
+  work.next("progress");
+  work.complete();
+  await processing;
+  assert.equal(receiver.completed.length, 1);
+  await server.close();
+});
+
 test("@Queue stores queue metadata and an event pattern", () => {
   const options = { queueName: "jobs", receiveMode: "peekLock" };
   class Handlers {

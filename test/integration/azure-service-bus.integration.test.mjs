@@ -436,11 +436,6 @@ describe(
 
     test(
       "peekLock: a handler error abandons the message and it is redelivered",
-      {
-        todo:
-          "Nest's exception filter turns a handler error into an errored Observable that " +
-          "handleEvent() never awaits, so the message is completed, not abandoned",
-      },
       async () => {
         const deliveries = [];
         const done = deferred("the redelivery", 5_000);

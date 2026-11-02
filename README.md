@@ -234,7 +234,7 @@ async getMessages(
 
 `context.getMessage()` returns the same message the handler gets as payload.
 
-Note that an exception thrown by an event handler is caught by Nest's exception filter, so with automatic completion the message is still completed. Settle it yourself, as above, if a failure must make it be redelivered.
+If the handler throws (or returns an Observable that errors) and has not settled the message, the message is abandoned: Service Bus delivers it again, and after the entity's max delivery count moves it to the dead-letter queue. In `receiveAndDelete` mode the message is already gone, so the error is only logged. A handler that returns an Observable has its message completed when that Observable completes.
 
 ##### Shutdown
 

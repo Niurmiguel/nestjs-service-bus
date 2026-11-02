@@ -2,7 +2,9 @@ import {
   Server,
   WritePacket,
   CustomTransportStrategy,
+  ReadPacket,
 } from "@nestjs/microservices";
+import { BaseRpcContext } from "@nestjs/microservices/ctx-host/base-rpc.context";
 import {
   MessageHandlers,
   ProcessErrorArgs,
@@ -12,7 +14,7 @@ import {
   ServiceBusReceiver,
   ServiceBusReceiverOptions,
 } from "@azure/service-bus";
-import { Observable } from "rxjs";
+import { finalize, isObservable, lastValueFrom, Observable } from "rxjs";
 
 import {
   SB_REPLY_DISPOSED_PROPERTY,
@@ -41,6 +43,29 @@ interface ActiveReceiver {
 interface SubscriberPattern {
   type?: keyof SbSubscriberTypeMap;
   metaOptions: Partial<SbSubscriptionMetadataOptions & SbQueueMetadataOptions>;
+}
+
+/** The NestJS 11 processing hooks, read without requiring their types. */
+interface ProcessingHooks {
+  transportId?: unknown;
+  onProcessingStartHook?: (
+    transportId: unknown,
+    context: unknown,
+    done: () => Promise<void>
+  ) => unknown;
+  onProcessingEndHook?: (transportId: unknown, context: unknown) => void;
+}
+
+/** A short description of what a handler failed with, for the logs. */
+function describeError(err: unknown): string {
+  if (err instanceof Error) {
+    return err.message;
+  }
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
 }
 
 /** Resolves when `promise` settles, whatever the outcome. */
@@ -143,24 +168,33 @@ export class AzureServiceBusServer
   });
 
   /**
-   * Runs the handler and then, in peekLock mode, completes the message unless
-   * the handler already settled it or `autoCompleteMessages` is false. A
-   * handler error rejects, and the SDK abandons the message.
+   * Runs the handler. In peekLock mode, unless the handler already settled the
+   * message, it then completes it (when `autoCompleteMessages` is not false)
+   * or, if the handler failed, abandons it so that it is delivered again.
    */
   private async processMessage(
     receivedMessage: ServiceBusReceivedMessage,
     pattern: string
   ): Promise<void> {
-    await this.handleMessage(receivedMessage, pattern);
-
     const active = this.receivers.get(pattern);
-    if (!active?.autoComplete || active.receiver.receiveMode !== "peekLock") {
-      return;
+    const peekLock = active?.receiver.receiveMode === "peekLock";
+    let failure: { err: unknown } | undefined;
+    try {
+      await this.handleMessage(receivedMessage, pattern);
+    } catch (err) {
+      failure = { err };
     }
-    // Same check the SDK's own auto-completion uses.
+
+    // Same check the SDK's own settlement uses.
     const delivery = (receivedMessage as { delivery?: { remote_settled?: boolean } })
       .delivery;
-    if (delivery?.remote_settled) {
+    const settled = delivery?.remote_settled === true;
+
+    if (failure) {
+      await this.abandonAfterFailure(receivedMessage, active, peekLock && !settled, failure.err);
+      return;
+    }
+    if (!active?.autoComplete || !peekLock || settled) {
       return;
     }
     try {
@@ -175,6 +209,75 @@ export class AzureServiceBusServer
         (err as Error)?.stack
       );
     }
+  }
+
+  private async abandonAfterFailure(
+    message: ServiceBusReceivedMessage,
+    active: ActiveReceiver | undefined,
+    abandon: boolean,
+    err: unknown
+  ): Promise<void> {
+    const where = `message ${message.messageId} on "${active?.receiver.entityPath}"`;
+    if (!abandon) {
+      // receiveAndDelete (the message is gone), or the handler settled it.
+      this.logger.error(`The handler of ${where} failed: ${describeError(err)}`);
+      return;
+    }
+    try {
+      await active.receiver.abandonMessage(message);
+      this.logger.warn(
+        `The handler of ${where} failed; the message was abandoned and will be delivered ` +
+          `again (and dead-lettered after the max delivery count): ${describeError(err)}`
+      );
+    } catch (abandonErr) {
+      this.logger.error(
+        `The handler of ${where} failed (${describeError(err)}) and the message could not be ` +
+          `abandoned; it is delivered again when its lock expires: ${describeError(abandonErr)}`
+      );
+    }
+  }
+
+  /**
+   * Nest's `handleEvent()` neither waits for an Observable returned by the
+   * handler nor reports its error, and an error thrown by a handler reaches
+   * it as exactly that: an Observable that errors (Nest's exception filter).
+   * This one waits for the handler, Observable included, and rejects when it
+   * fails, so that the message can be abandoned rather than completed.
+   */
+  public async handleEvent(
+    pattern: string,
+    packet: ReadPacket,
+    context: BaseRpcContext
+  ): Promise<any> {
+    const handler = this.getHandlerByPattern(pattern);
+    if (!handler) {
+      return this.logger.error(
+        `There is no matching event handler defined in the remote service. Event pattern: ${pattern}`
+      );
+    }
+    // Processing hooks exist since NestJS 11.
+    const hooks = this as unknown as ProcessingHooks;
+    const end = () => hooks.onProcessingEndHook?.(hooks.transportId, context);
+    const run = async () => {
+      const resultOrStream = await handler(packet.data, context);
+      if (isObservable(resultOrStream)) {
+        await lastValueFrom(resultOrStream.pipe(finalize(end)), { defaultValue: undefined });
+      } else {
+        end();
+      }
+    };
+    if (!hooks.onProcessingStartHook) {
+      return run();
+    }
+    // The hook decides when (and whether) the handler runs; it may not return
+    // what `done` returns, so the outcome is kept here.
+    let outcome: Promise<void> | undefined;
+    await hooks.onProcessingStartHook(hooks.transportId, context, () => {
+      outcome = run();
+      outcome.catch(() => undefined); // awaited below
+      return outcome;
+    });
+    await outcome;
   }
 
   public async handleMessage(

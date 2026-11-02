@@ -188,6 +188,8 @@ export class AzureServiceBusServer
    * would cancel it).
    */
   private generation = 0;
+  /** `allowedReplyTo`'s verdict per request, so it is asked once. */
+  private readonly replyToRejected = new WeakMap<ServiceBusReceivedMessage, boolean>();
   private closing: Promise<void> | undefined;
   /** `options.closeTimeoutInMs`, checked. */
   private readonly closeTimeoutInMs: number;
@@ -369,13 +371,27 @@ export class AzureServiceBusServer
 
   /**
    * Whether `message` is a request whose `replyTo` the `allowedReplyTo`
-   * option does not allow. Logs a warning when it is.
+   * option does not allow. Logs a warning when it is. `allowedReplyTo` is
+   * asked once per message: `processMessage()` and `handleMessage()` both
+   * check, and a function that answered differently the second time would
+   * get a request completed with no reply.
    */
   private rejectsReplyTo(message: ServiceBusReceivedMessage): boolean {
     const { replyTo } = message;
     if (!replyTo || !this.isReplyToAllowed) {
       return false;
     }
+    const known = this.replyToRejected.get(message);
+    if (known !== undefined) {
+      return known;
+    }
+    const rejected = !this.isReplyToAllowedFor(message, replyTo);
+    this.replyToRejected.set(message, rejected);
+    return rejected;
+  }
+
+  /** Asks `allowedReplyTo`; logs a warning when it denies. */
+  private isReplyToAllowedFor(message: ServiceBusReceivedMessage, replyTo: string): boolean {
     let allowed = false;
     try {
       allowed = this.isReplyToAllowed(replyTo, message) === true;
@@ -390,7 +406,7 @@ export class AzureServiceBusServer
           } is not allowed by allowedReplyTo. The handler did not run and no reply was sent.`
       );
     }
-    return !allowed;
+    return allowed;
   }
 
   /** Settles a request that `rejectsReplyTo()`: it is never valid, so no retry. */

@@ -1943,6 +1943,28 @@ test("a failed reply to a 1.1.0 client gets no error reply after it (it would re
   await server.close();
 });
 
+test("allowedReplyTo is called once per request", async () => {
+  let calls = 0;
+  const counting = await listeningWithReplies(async () => "ok", {
+    allowedReplyTo: () => {
+      calls++;
+      return true;
+    },
+  });
+  await counting.receiver.handlers.processMessage(requestFrom120());
+  assert.equal(calls, 1);
+  await counting.server.close();
+
+  // A function that changes its mind cannot get a request completed unanswered.
+  let k = 0;
+  const flaky = await listeningWithReplies(async () => "ok", { allowedReplyTo: () => ++k === 1 });
+  const request = requestFrom120();
+  await flaky.receiver.handlers.processMessage(request);
+  assert.equal(flaky.replies.length, 1);
+  assert.deepEqual(flaky.receiver.completed, [request]);
+  await flaky.server.close();
+});
+
 test("close() cancels an endless Observable of an event handler too", async () => {
   const endless = endlessResponse();
   const { server, receiver, logged } = await listeningWith(

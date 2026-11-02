@@ -14,6 +14,7 @@ const {
   AzureServiceBusContext,
   AzureServiceBusModule,
   AzureServiceBusServer,
+  Queue,
   Subscription,
 } = require("../dist");
 const { SB_SUBSCRIBER_METADATA } = require("../dist/azure-service-bus.constants");
@@ -377,6 +378,21 @@ test("server completes peekLock messages after the handler unless told not to", 
     assert.equal(completed.length, expected, JSON.stringify(options));
     await server.close();
   }
+});
+
+test("@Queue stores queue metadata and an event pattern", () => {
+  const options = { queueName: "jobs", receiveMode: "peekLock" };
+  class Handlers {
+    onJob() {}
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(Handlers.prototype, "onJob");
+  Queue(options)(Handlers.prototype, "onJob", descriptor);
+
+  const [stored] = Reflect.getMetadata(SB_SUBSCRIBER_METADATA, Handlers.prototype);
+  assert.equal(stored.metadata.type, "queue");
+  assert.deepEqual(stored.metadata.metaOptions, options);
+  const [pattern] = Reflect.getMetadata(PATTERN_METADATA, descriptor.value);
+  assert.deepEqual(pattern.metaOptions, options);
 });
 
 test("the context exposes the receiver and the message", () => {

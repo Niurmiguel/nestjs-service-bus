@@ -25,6 +25,7 @@ const {
   AzureServiceBusContext,
   AzureServiceBusServer,
   Queue,
+  ReplyTimeoutError,
   Subscription,
 } = require("../../dist");
 const {
@@ -255,6 +256,66 @@ describe(
         assert.equal(outcome.error.code, "MessagingEntityNotFound");
       } finally {
         await client.close();
+      }
+    });
+
+    /** Empties `entity` (requests nobody answered), so they do not pile up between runs. */
+    function drain(entity) {
+      return withSdk(async (sdk) => {
+        const receiver = sdk.createReceiver(entity, { receiveMode: "receiveAndDelete" });
+        while ((await receiver.receiveMessages(50, { maxWaitTimeInMs: 500 })).length > 0);
+        await receiver.close();
+      });
+    }
+
+    /** Settles `observable` into `{ value }`, `{ error }` or "timeout". */
+    function outcomeOf(observable, ms) {
+      return Promise.race([
+        firstValueFrom(observable).then(
+          (value) => ({ value }),
+          (error) => ({ error })
+        ),
+        timeoutAfter(ms),
+      ]);
+    }
+
+    test("send() fails when its reply queue does not exist", async () => {
+      // itest.noreply exists, itest.noreply.reply does not.
+      const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+      const logger = captureLogger();
+      client.logger = logger;
+      try {
+        const outcome = await outcomeOf(
+          client.send({ name: "itest.noreply" }, { body: { runId } }),
+          20_000
+        );
+        assert.notEqual(outcome, "timeout", "send() kept waiting for a reply queue that does not exist");
+        assert.equal(outcome.error?.code, "MessagingEntityNotFound");
+        assert.match(String(logger.errors()[0]?.message), /itest\.noreply\.reply/);
+      } finally {
+        await client.close();
+        await drain("itest.noreply");
+      }
+    });
+
+    test("send() with replyTimeoutInMs fails when no reply comes", async () => {
+      // Nobody listens on itest.timeout: the request is sent, the reply never comes.
+      const client = new AzureServiceBusClient({
+        connectionString: CONNECTION_STRING,
+        replyTimeoutInMs: 1500,
+      });
+      try {
+        const started = Date.now();
+        const outcome = await outcomeOf(
+          client.send({ name: "itest.timeout" }, { body: { runId } }),
+          15_000
+        );
+        assert.notEqual(outcome, "timeout");
+        assert.ok(outcome.error instanceof ReplyTimeoutError, String(outcome.error));
+        assert.ok(Date.now() - started >= 1400);
+      } finally {
+        await client.close();
+        await drain("itest.timeout");
       }
     });
 

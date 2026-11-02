@@ -7,6 +7,7 @@ require("reflect-metadata");
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { lastValueFrom } = require("rxjs");
+const { ServiceBusError } = require("@azure/service-bus");
 const { PATTERN_METADATA } = require("@nestjs/microservices/constants");
 
 const {
@@ -15,6 +16,7 @@ const {
   AzureServiceBusModule,
   AzureServiceBusServer,
   Queue,
+  ReplyTimeoutError,
   Subscription,
 } = require("../dist");
 const { SB_SUBSCRIBER_METADATA } = require("../dist/azure-service-bus.constants");
@@ -303,6 +305,61 @@ test("a receiver that fails to close is logged, not left as an unhandled rejecti
     logged.some((e) => e.level === "error" && /link detach failed/.test(String(e.args[0]))),
     JSON.stringify(logged)
   );
+});
+
+test("client processError on a reply queue logs and resolves", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  const logged = [];
+  client.logger = silentLogger(logged);
+  const { processError } = client.createMessageHandlers({ id: "r-1", pattern: {}, data: {} });
+
+  const result = await Promise.race([
+    processError({ error: new Error("link detached"), errorSource: "receive", entityPath: "q.reply" }).then(
+      () => "resolved",
+      () => "rejected"
+    ),
+    new Promise((resolve) => setTimeout(resolve, 200, "pending").unref()),
+  ]);
+  assert.equal(result, "resolved");
+  assert.match(String(logged[0].args[0]), /receive error on the reply queue "q.reply": link detached/);
+});
+
+test("client.send fails when its reply queue does not exist", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  client.logger = silentLogger();
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+
+  const reply = lastValueFrom(client.send({ name: "orders" }, { body: 1 }));
+  await ticks();
+  const notFound = new ServiceBusError("The messaging entity could not be found", "MessagingEntityNotFound");
+  await sdk.receivers[0].handlers.processError({
+    error: notFound,
+    errorSource: "receive",
+    entityPath: "orders.reply",
+  });
+  await assert.rejects(reply, { code: "MessagingEntityNotFound" });
+});
+
+test("client.send fails with ReplyTimeoutError after replyTimeoutInMs", async () => {
+  const client = new AzureServiceBusClient({
+    connectionString: CONNECTION_STRING,
+    replyTimeoutInMs: 50,
+  });
+  client.logger = silentLogger();
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+
+  const started = Date.now();
+  await assert.rejects(lastValueFrom(client.send({ name: "orders" }, { body: 1 })), (err) => {
+    assert.ok(err instanceof ReplyTimeoutError);
+    assert.equal(err.replyTo, "orders.reply");
+    assert.equal(err.timeoutInMs, 50);
+    return true;
+  });
+  assert.ok(Date.now() - started >= 45);
+  await ticks();
+  assert.equal(sdk.receivers[0].closed, true, "the reply receiver was not closed");
 });
 
 test("client.emit rejects a missing pattern or payload", async () => {

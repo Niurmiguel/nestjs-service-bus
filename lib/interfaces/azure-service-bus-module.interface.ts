@@ -1,8 +1,8 @@
 import { ModuleMetadata, Provider, Type } from "@nestjs/common";
 
-import { AzureServiceBusOptions } from "./azure-service-bus.interface";
+import { AzureServiceBusClientOptions } from "./azure-service-bus.interface";
 
-export type AzureServiceBusProvider = AzureServiceBusOptions;
+export type AzureServiceBusProvider = AzureServiceBusClientOptions;
 
 export type AzureServiceBusProviderOptions = AzureServiceBusProvider & {
   name: string | symbol;

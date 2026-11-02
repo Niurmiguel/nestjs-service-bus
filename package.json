@@ -7,7 +7,7 @@
   "scripts": {
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
     "prepack": "npm run build",
-    "test": "npm run build && node --test test/azure-service-bus.test.js",
+    "test": "npm run build && node --test --test-timeout=10000 test/azure-service-bus.test.js",
     "test:integration": "npm run build && node --test --test-force-exit --test-timeout=60000 test/integration/azure-service-bus.integration.test.mjs"
   },
   "repository": {

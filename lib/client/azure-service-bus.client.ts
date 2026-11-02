@@ -1,4 +1,5 @@
 import {
+  isServiceBusError,
   MessageHandlers,
   ProcessErrorArgs,
   ServiceBusClient,
@@ -12,8 +13,9 @@ import { PacketId, ReadPacket, WritePacket } from "@nestjs/microservices";
 import { Injectable } from "@nestjs/common";
 
 import { AzureServiceBusClientProxy } from ".";
+import { ReplyTimeoutError } from "../errors";
 import {
-  AzureServiceBusOptions,
+  AzureServiceBusClientOptions,
   AzureServiceBusSenderOptions,
 } from "../interfaces";
 
@@ -44,7 +46,7 @@ export class AzureServiceBusClient extends AzureServiceBusClientProxy {
   /** Sends and receiver closes in progress, which `close()` waits for. */
   private readonly inFlight = new Set<Promise<unknown>>();
 
-  constructor(protected readonly options: AzureServiceBusOptions) {
+  constructor(protected readonly options: AzureServiceBusClientOptions) {
     super();
 
     this.initializeSerializer(options);
@@ -109,7 +111,17 @@ export class AzureServiceBusClient extends AzureServiceBusClientProxy {
       // A failed send (e.g. the entity does not exist) errors the Observable.
       this.sendTo(name, messages, options).catch((err) => callback({ err }));
 
+      const { replyTimeoutInMs } = this.options;
+      const timer =
+        replyTimeoutInMs > 0
+          ? setTimeout(
+              () => callback({ err: new ReplyTimeoutError(replyTo, replyTimeoutInMs) }),
+              replyTimeoutInMs
+            )
+          : undefined;
+
       return () => {
+        clearTimeout(timer);
         this.routingMap.delete(packet.id);
         abortController.abort();
         this.track(subscription.close().then(() => receiver.close())).catch((err) =>
@@ -167,10 +179,24 @@ export class AzureServiceBusClient extends AzureServiceBusClientProxy {
       await receiver?.completeMessage(receivedMessage);
       await this.handleMessage(receivedMessage, packet);
     },
-    processError: async (args: ProcessErrorArgs): Promise<void> => {
-      return new Promise<void>(() => {
-        throw new Error(`Error processing message: ${args.error}`);
-      });
+    processError: async ({ error, errorSource, entityPath }: ProcessErrorArgs) => {
+      // It must resolve: the SDK awaits it, and a rejection would surface as
+      // an unhandled rejection. The SDK keeps retrying on its own.
+      const err = error as Error | undefined;
+      if (err?.name === "AbortError") {
+        return; // The request ended and its receiver is being closed.
+      }
+      this.logger.error(
+        `Azure Service Bus ${errorSource} error on the reply queue "${entityPath}": ${
+          err?.message ?? err
+        }`,
+        err?.stack
+      );
+      // Retrying cannot help when the reply queue does not exist: fail the
+      // request instead of leaving it waiting forever.
+      if (isServiceBusError(err) && err.code === "MessagingEntityNotFound") {
+        this.routingMap.get(packet.id)?.({ err });
+      }
     },
   });
 

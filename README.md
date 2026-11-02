@@ -70,7 +70,7 @@ The server (`new AzureServiceBusServer({...})`) also accepts:
   </tr>
   <tr>
     <td><code>closeTimeoutInMs</code></td>
-    <td>How long <code>close()</code> waits for the handlers that are running. <code>30000</code> (30 seconds) by default; <code>Infinity</code> waits for as long as they take. See <a href="#shutdown">Shutdown</a>.</td>
+    <td>How long <code>close()</code> waits for the handlers that are running and the streamed responses they are still sending. <code>30000</code> (30 seconds) by default; <code>Infinity</code> waits for as long as they take. See <a href="#shutdown">Shutdown</a>.</td>
   </tr>
   <tr>
     <td><code>replyTimeToLiveInMs</code></td>
@@ -188,7 +188,8 @@ this.sbClient.emit(pattern, data);
 `send()` sends the request to `name` and waits for the reply on the queue `<name>.reply`, which must exist. The client matches each reply to its request by `correlationId` (a random UUID per request), so concurrent `send()` calls each get their own reply.
 
 - The server sends each value of the handler's response as soon as it is emitted. Values emitted together, and the end of the response when it comes right after the last of them, travel together: a handler that returns one value sends one message. A response that ends later sends its end as a message of its own.
-- The request message is completed once its first reply is sent; the rest of a streamed response goes on in the background (`close()` of the server waits for it, up to `closeTimeoutInMs`).
+- The request message is completed once its first reply is sent; the rest of a streamed response goes on in the background (`close()` of the server waits for it, up to `closeTimeoutInMs`, and then cancels it).
+- If a reply cannot be sent, the server logs it at once, unsubscribes the response and sends the client an error reply instead of the rest (Nest's generic `{ status: 'error', message: 'Internal server error' }`). If that error reply cannot be sent either, the client gets nothing more: only its `replyTimeoutInMs` ends the wait.
 - If the handler fails, the Observable fails with the error Nest's exception filter makes of it, as in Nest's other transports: `{ status: 'error', message: 'Internal server error' }` for an unknown error, or the payload of an `RpcException`.
 - If the request cannot be sent (e.g. the entity does not exist), or the reply queue cannot be received from (it does not exist, or its sessions setting does not match `replySessions`), the Observable fails.
 - `close()` waits for the sends in flight and fails the `send()` calls still waiting for a reply.
@@ -204,7 +205,7 @@ For several clients, use sessions: each client then receives only the replies se
 
 While the reply queue is being replaced, set `replyTimeoutInMs` on the clients, so that a request whose reply is lost fails instead of waiting forever.
 
-Clients before 1.2.0 take the first message on their reply queue as the whole response, whatever its `correlationId`. A 1.2.0 server therefore sends them a single reply (the first value, the error or the end of an empty response) and nothing more, so that no later request of theirs gets it as an answer. Upgrade the clients to get streamed responses and errors.
+Clients before 1.2.0 take the first message on their reply queue as the whole response, whatever its `correlationId`. A 1.2.0 server therefore sends them a single reply (the first value, the error or the end of an empty response) and nothing more, so that no later request of theirs gets it as an answer; the handler's Observable is unsubscribed after that reply. Upgrade the clients to get streamed responses and errors.
 
 ##### Consumer
 
@@ -307,7 +308,12 @@ While a handler runs in `peekLock` mode, the SDK renews the message's lock for u
 
 Closing the application (`app.close()`) stops receiving new messages, waits for the handlers that are running to finish (and for their messages to be completed), and then closes the receivers and the connection.
 
-It waits for up to `closeTimeoutInMs` (30 seconds by default). When that runs out, a warning is logged and the receivers and the connection are closed anyway: the messages of the handlers still running are not settled, and in `peekLock` mode Service Bus delivers them again once their lock expires. Make it shorter than the time your platform gives a process to stop (e.g. Kubernetes' `terminationGracePeriodSeconds`, 30 seconds by default), or set `Infinity` to wait for as long as the handlers take.
+It waits for up to `closeTimeoutInMs` (30 seconds by default), including the rest of the streamed responses being sent. When that runs out, the Observables of the handlers still running are unsubscribed, a warning is logged, and the receivers and the connection are closed anyway:
+
+- A handler still running has its message left unsettled: in `peekLock` mode Service Bus delivers it again once its lock expires (in `receiveAndDelete` mode it is gone).
+- A streamed response whose request already had its first reply (so its message was completed) just stops: its client gets no further replies and, with `replyTimeoutInMs` set, fails after it.
+
+Make it shorter than the time your platform gives a process to stop (e.g. Kubernetes' `terminationGracePeriodSeconds`, 30 seconds by default), or set `Infinity` to wait for as long as the handlers take.
 
 ## Security
 

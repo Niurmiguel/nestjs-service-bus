@@ -40,10 +40,13 @@ export interface AzureServiceBusServerOptions extends AzureServiceBusOptions {
    */
   allowedReplyTo?: AllowedReplyTo;
   /**
-   * How long `close()` waits for the handlers that are running. When it runs
-   * out, the receivers and the connection are closed anyway and a warning is
-   * logged: the messages of the handlers still running are not settled, so
-   * Service Bus delivers them again once their lock expires.
+   * How long `close()` waits for the handlers that are running, and for the
+   * rest of the streamed responses they are sending. When it runs out, the
+   * Observables of those handlers are unsubscribed, the receivers and the
+   * connection are closed anyway, and a warning is logged: the messages of
+   * the handlers still running are not settled, so in `peekLock` mode Service
+   * Bus delivers them again once their lock expires; a streamed response whose
+   * request was already completed just ends without further replies.
    *
    * - **Default**: `30000` (30 seconds). `Infinity` waits for as long as the
    *   handlers take; `0` does not wait.

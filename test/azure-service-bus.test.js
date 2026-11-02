@@ -1610,7 +1610,7 @@ test("server close() stops waiting for handlers after closeTimeoutInMs and close
     assert.equal(receiver.closed, true);
     assert.equal(fake.closed, true);
     assert.deepEqual(receiver.completed, []);
-    assert.match(String(logged.find((e) => e.level === "warn")?.args[0]), /closeTimeoutInMs.*1 handler/);
+    assert.match(String(logged.find((e) => e.level === "warn")?.args[0]), /closeTimeoutInMs.*1 message handler/);
   }
 });
 
@@ -1707,4 +1707,256 @@ test("a streamed request is completed once its first reply is out, and close() w
     ["first", "response", false],
     ["second", "response", true],
   ]);
+});
+
+// --- Streams that close() cuts, and replies that cannot be sent ---------------
+
+/**
+ * Listens with one peekLock @Queue handler whose replies are recorded (or
+ * sent with `sendMessages`, when given).
+ */
+async function listeningWithReplies(handler, serverOptions = {}, sendMessages) {
+  const listening = await listeningWith(handler, { receiveMode: "peekLock" }, serverOptions);
+  const replies = [];
+  listening.fake.client.createSender = (entity) => ({
+    sendMessages:
+      sendMessages ?? (async (messages) => replies.push(...messages.map((m) => ({ entity, ...m })))),
+    close: async () => {},
+  });
+  return { ...listening, replies };
+}
+
+/** An endless response that records how often it emits and whether it is torn down. */
+function endlessResponse(periodMs = 20) {
+  const { interval, finalize, tap } = require("rxjs");
+  const state = { emitted: 0, tornDown: false };
+  state.observable = interval(periodMs).pipe(
+    tap(() => state.emitted++),
+    finalize(() => (state.tornDown = true))
+  );
+  return state;
+}
+
+const activeTimers = () => process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
+
+test("close() cancels an endless streamed response after closeTimeoutInMs", async () => {
+  const endless = endlessResponse();
+  const timersBefore = activeTimers();
+  const { server, receiver, logged, replies } = await listeningWithReplies(
+    async () => endless.observable,
+    { closeTimeoutInMs: 100 }
+  );
+  const request = requestFrom120();
+  await receiver.handlers.processMessage(request); // resolves after the first reply
+  assert.deepEqual(receiver.completed, [request]);
+
+  await server.close();
+  assert.equal(endless.tornDown, true, "the response is still subscribed after close()");
+  assert.equal(server.inFlight.size, 0);
+  const emitted = endless.emitted;
+  const sent = replies.length;
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(endless.emitted, emitted, "the handler kept emitting after close()");
+  assert.equal(replies.length, sent);
+  assert.ok(activeTimers() <= timersBefore, `${timersBefore} -> ${activeTimers()} timers`);
+
+  // The request was completed: the warning must not say it comes back.
+  const warning = String(logged.find((e) => e.level === "warn")?.args[0]);
+  assert.match(warning, /closeTimeoutInMs/);
+  assert.match(warning, /1 streamed response\(s\) cancelled.*already completed/);
+  assert.doesNotMatch(warning, /delivers them again/);
+});
+
+test("close() cancels a response that has not replied yet, and leaves its message unsettled", async () => {
+  const { NEVER, finalize } = require("rxjs");
+  let tornDown = false;
+  const { server, receiver, logged, replies } = await listeningWithReplies(
+    async () => NEVER.pipe(finalize(() => (tornDown = true))),
+    { closeTimeoutInMs: 50 }
+  );
+  const processing = receiver.handlers.processMessage(requestFrom120());
+  await ticks();
+  await server.close();
+  await processing;
+  assert.equal(tornDown, true);
+  assert.deepEqual(replies, []);
+  // Not completed nor abandoned (the receiver is closing): back when its lock expires.
+  assert.deepEqual(receiver.completed, []);
+  assert.deepEqual(receiver.abandoned, []);
+  const warning = String(logged.find((e) => e.level === "warn")?.args[0]);
+  assert.match(warning, /1 message handler\(s\) still running.*delivers them again once their lock expires/);
+  assert.doesNotMatch(warning, /streamed response/);
+});
+
+test("after a close() that gave up, a new listen() + close() does not wait for the old handlers", async () => {
+  const { server, receiver, logged } = await listeningWithReplies(
+    async () => new Promise(() => {}), // never settles
+    { closeTimeoutInMs: 50 }
+  );
+  receiver.handlers.processMessage({ body: {}, messageId: "m-1" });
+  await ticks();
+  await server.close();
+  assert.equal(server.inFlight.size, 0);
+
+  await listen(server);
+  logged.length = 0;
+  const started = Date.now();
+  await server.close();
+  assert.ok(Date.now() - started < 40, `the second close() took ${Date.now() - started} ms`);
+  assert.deepEqual(logged.filter((e) => e.level === "warn"), []);
+});
+
+test("a response a handler returns after close() gave up is not subscribed", async () => {
+  const endless = endlessResponse();
+  let release;
+  const { server, receiver, replies } = await listeningWithReplies(
+    () => new Promise((resolve) => (release = () => resolve(endless.observable))),
+    { closeTimeoutInMs: 30 }
+  );
+  const processing = receiver.handlers.processMessage(requestFrom120());
+  await ticks();
+  await server.close();
+  release();
+  await processing;
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(endless.emitted, 0, "the late response was subscribed");
+  assert.deepEqual(replies, []);
+  assert.deepEqual(receiver.completed, []);
+});
+
+test("the process exits on its own after close() cuts an endless response", async () => {
+  const { spawn } = require("node:child_process");
+  const path = require("node:path");
+  const child = spawn(process.execPath, [path.join(__dirname, "close-stream-exit.js")], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let output = "";
+  child.stdout.on("data", (chunk) => (output += chunk));
+  child.stderr.on("data", (chunk) => (output += chunk));
+  const exited = new Promise((resolve) => child.once("exit", (code) => resolve(code)));
+  const outcome = await Promise.race([
+    exited,
+    new Promise((resolve) => setTimeout(resolve, 5000, "still running").unref()),
+  ]);
+  if (outcome === "still running") child.kill("SIGKILL");
+  assert.equal(outcome, 0, output);
+  assert.match(output, /^closed$/m);
+});
+
+test("a 1.1.0 client's single reply ends the response: close() does not wait for the rest", async () => {
+  const endless = endlessResponse();
+  const { server, receiver, logged, replies } = await listeningWithReplies(
+    async () => endless.observable,
+    { closeTimeoutInMs: 1_000 }
+  );
+  const legacy = { body: null, messageId: "m-110", replyTo: "rpc.reply" };
+  await receiver.handlers.processMessage(legacy);
+  assert.equal(endless.tornDown, true, "the response is still subscribed after its only reply");
+  assert.deepEqual(replyShape(replies), [[0, "response", true]]);
+  assert.deepEqual(receiver.completed, [legacy]);
+
+  const started = Date.now();
+  await server.close();
+  assert.ok(Date.now() - started < 500, `close() took ${Date.now() - started} ms`);
+  assert.deepEqual(logged.filter((e) => e.level === "warn"), []);
+});
+
+test("a reply that fails mid-stream is logged at once, cancels the response and sends the client an error", async () => {
+  const { Subject, finalize } = require("rxjs");
+  const values = new Subject();
+  let tornDown = false;
+  let sends = 0;
+  const { server, receiver, logged, replies } = await listeningWithReplies(
+    async () => values.pipe(finalize(() => (tornDown = true))),
+    {},
+    async (messages) => {
+      if (++sends === 2) throw new Error("reply queue is busy");
+      replies.push(...messages);
+    }
+  );
+  const processing = receiver.handlers.processMessage(requestFrom120());
+  await ticks();
+  values.next(1);
+  await processing;
+  values.next(2); // fails
+  await ticks(20);
+  // Logged now, not when the (endless) response ends.
+  const errors = logged.filter((e) => e.level === "error");
+  assert.equal(errors.length, 1);
+  assert.match(String(errors[0].args[0]), /Could not send the reply to "rpc.reply": reply queue is busy/);
+  assert.match(String(errors[0].args[0]), /sent an error instead/);
+  assert.equal(tornDown, true, "the response is still subscribed");
+  assert.equal(values.observed, false);
+  // The client gets the end of the response, as an error.
+  assert.deepEqual(replyShape(replies), [
+    [1, "response", false],
+    [{ status: "error", message: "Internal server error" }, "error", true],
+  ]);
+  assert.equal(server.inFlight.size, 0);
+  const started = Date.now();
+  await server.close();
+  assert.ok(Date.now() - started < 100, `close() took ${Date.now() - started} ms`);
+});
+
+test("when the error reply cannot be sent either, the failure is logged once and the response still ends", async () => {
+  const { Subject } = require("rxjs");
+  const values = new Subject();
+  let sends = 0;
+  const { server, receiver, logged, replies } = await listeningWithReplies(
+    async () => values,
+    {},
+    async (messages) => {
+      if (++sends >= 2) throw new Error("reply queue is gone");
+      replies.push(...messages);
+    }
+  );
+  const processing = receiver.handlers.processMessage(requestFrom120());
+  await ticks();
+  values.next(1);
+  await processing;
+  values.next(2);
+  await ticks(20);
+  assert.equal(sends, 3, "one value, the failed one, and one error reply");
+  const errors = logged.filter((e) => e.level === "error");
+  assert.equal(errors.length, 1);
+  assert.match(String(errors[0].args[0]), /reply queue is gone.*could not be sent either.*replyTimeoutInMs/);
+  assert.equal(values.observed, false);
+  assert.equal(server.inFlight.size, 0);
+  await server.close();
+});
+
+test("a failed reply to a 1.1.0 client gets no error reply after it (it would read it as its next answer)", async () => {
+  const { of } = require("rxjs");
+  let sends = 0;
+  const { server, receiver, logged } = await listeningWithReplies(
+    async () => of(1, 2),
+    {},
+    async () => {
+      sends++;
+      throw new Error("reply queue is gone");
+    }
+  );
+  await receiver.handlers.processMessage({ body: null, messageId: "m-110", replyTo: "rpc.reply" });
+  await ticks();
+  assert.equal(sends, 1);
+  assert.equal(logged.filter((e) => e.level === "error").length, 1);
+  await server.close();
+});
+
+test("close() cancels an endless Observable of an event handler too", async () => {
+  const endless = endlessResponse();
+  const { server, receiver, logged } = await listeningWith(
+    async () => endless.observable,
+    { receiveMode: "peekLock" },
+    { closeTimeoutInMs: 50 }
+  );
+  const processing = receiver.handlers.processMessage({ body: {}, messageId: "e-1" });
+  await ticks();
+  await server.close();
+  await processing;
+  assert.equal(endless.tornDown, true, "the event's Observable is still subscribed after close()");
+  // Neither completed nor abandoned: delivered again once its lock expires.
+  assert.deepEqual(receiver.completed, []);
+  assert.deepEqual(receiver.abandoned, []);
+  assert.match(String(logged.find((e) => e.level === "warn")?.args[0]), /1 message handler\(s\) still running/);
 });

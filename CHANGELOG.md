@@ -187,13 +187,19 @@ Read these before upgrading a service that relies on the 1.1.0 behavior.
   delivered again).
 - **Streamed responses**: each value is sent when it is emitted, and the
   request message is completed once the first reply is sent; the rest of the
-  response is sent in the background, and `close()` waits for it.
-- **`close()` of the server** waits for the handlers that are running, for up
-  to `closeTimeoutInMs` (30 seconds by default). 1.1.0 did not wait at all;
-  after the time limit the receivers are closed anyway and, in `peekLock`
-  mode, the messages of the handlers still running are delivered again once
-  their lock expires. Set `closeTimeoutInMs: Infinity` to wait for as long as
-  the handlers take.
+  response is sent in the background, and `close()` waits for it. When a reply
+  cannot be sent, the response is unsubscribed and a 1.2.0 client gets an
+  error reply instead of the rest (if that one cannot be sent either, only the
+  client's `replyTimeoutInMs` ends its wait).
+- **`close()` of the server** waits for the handlers that are running and the
+  streamed responses they are still sending, for up to `closeTimeoutInMs` (30
+  seconds by default). 1.1.0 did not wait at all. After the time limit the
+  Observables of the handlers still running are unsubscribed and the
+  receivers are closed anyway: in `peekLock` mode the messages of the
+  handlers still running are delivered again once their lock expires, while
+  a streamed response whose request was already completed just ends (its
+  client gets no further replies). Set `closeTimeoutInMs: Infinity` to wait
+  for as long as the handlers take.
 - **Replies that are not the client's**: a client that receives a reply to a
   request it did not send abandons it (1.1.0 consumed it, and handed it to the
   wrong caller). With several clients on one reply queue, replies can bounce and
@@ -241,8 +247,8 @@ Read these before upgrading a service that relies on the 1.1.0 behavior.
 4. If you relied on getting `null` from `send()` when the handler failed,
    handle the error of the Observable now. Set `replyTimeoutInMs` on the
    clients, so that a request nobody answers does not wait forever.
-5. If handlers can run longer than 30 seconds, review `closeTimeoutInMs` (and
-   the time your platform gives the process to stop).
+5. If handlers (or streamed responses) can run longer than 30 seconds, review
+   `closeTimeoutInMs` (and the time your platform gives the process to stop).
 6. If several instances send requests to the same entity, use sessions on
    `<entity>.reply` and set `replySessions: true` on every client. Sessions
    cannot be turned on for an existing queue: the reply queue has to be

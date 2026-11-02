@@ -14,7 +14,15 @@ import {
   ServiceBusReceiver,
   ServiceBusReceiverOptions,
 } from "@azure/service-bus";
-import { finalize, isObservable, lastValueFrom, Observable, throwError } from "rxjs";
+import {
+  finalize,
+  isObservable,
+  Observable,
+  Observer,
+  Subscription,
+  take,
+  throwError,
+} from "rxjs";
 import { inspect, InspectOptionsStylized } from "util";
 
 import {
@@ -104,6 +112,54 @@ function describeError(err: unknown): string {
   }
 }
 
+/**
+ * Why a handler's Observable stopped being followed: `close()` gave up waiting
+ * for it (see `waitForInFlight()`). The message of that handler is left
+ * unsettled; nothing else is done with it.
+ */
+class CancelledByClose extends Error {
+  constructor() {
+    super("close() cancelled the handler after closeTimeoutInMs");
+    this.name = "CancelledByClose";
+  }
+}
+
+/**
+ * A subscription to a handler's Observable (a response, or the result of an
+ * event handler) that the server can stop: when a reply cannot be sent, and
+ * when `close()` gives up waiting for it.
+ */
+class FollowedObservable {
+  /** Whether its request had its first reply (or gave up on it). */
+  replied = false;
+  /** Whether `close()` stopped it. */
+  cancelledByClose = false;
+  private subscription: Subscription | undefined;
+  private stopped = false;
+
+  constructor(private readonly onStop: (byClose: boolean) => void) {}
+
+  start(source: Observable<unknown>, observer: Partial<Observer<unknown>>): void {
+    const subscription = source.subscribe(observer);
+    if (this.stopped) {
+      subscription.unsubscribe(); // stopped while subscribing
+    } else {
+      this.subscription = subscription;
+    }
+  }
+
+  stop(byClose = false): void {
+    if (this.stopped) {
+      return;
+    }
+    this.stopped = true;
+    this.cancelledByClose = byClose;
+    this.subscription?.unsubscribe();
+    this.subscription = undefined;
+    this.onStop(byClose);
+  }
+}
+
 /** Resolves when `promise` settles, whatever the outcome. */
 const settled = (promise: Promise<unknown>): Promise<unknown> =>
   promise.then(
@@ -120,6 +176,18 @@ export class AzureServiceBusServer
   private readonly receivers = new Map<string, ActiveReceiver>();
   /** Messages being handled right now, so `close()` can wait for them. */
   private readonly inFlight = new Set<Promise<void>>();
+  /**
+   * Handlers' Observables being followed, with what settles once each is
+   * over (a response: once its last reply is sent). `close()` waits for them
+   * and, when it gives up, unsubscribes them.
+   */
+  private readonly following = new Map<FollowedObservable, Promise<unknown>>();
+  /**
+   * Bumped when `close()` gives up on the handlers still running: an
+   * Observable that one of them returns later is not subscribed (nothing
+   * would cancel it).
+   */
+  private generation = 0;
   private closing: Promise<void> | undefined;
   /** `options.closeTimeoutInMs`, checked. */
   private readonly closeTimeoutInMs: number;
@@ -245,6 +313,11 @@ export class AzureServiceBusServer
       .delivery;
     const settled = delivery?.remote_settled === true;
 
+    if (failure?.err instanceof CancelledByClose) {
+      // close() gave up on it and is closing the receiver: left unsettled,
+      // the message is delivered again once its lock expires.
+      return;
+    }
     if (failure) {
       await this.abandonAfterFailure(receivedMessage, active, peekLock && !settled, failure.err);
       return;
@@ -363,12 +436,16 @@ export class AzureServiceBusServer
     // Processing hooks exist since NestJS 11.
     const hooks = this as unknown as ProcessingHooks;
     const end = () => hooks.onProcessingEndHook?.(hooks.transportId, context);
+    const generation = this.generation;
     const run = async () => {
       const resultOrStream = await handler(packet.data, context);
-      if (isObservable(resultOrStream)) {
-        await lastValueFrom(resultOrStream.pipe(finalize(end)), { defaultValue: undefined });
-      } else {
+      if (!isObservable(resultOrStream)) {
         end();
+      } else if (generation !== this.generation) {
+        end();
+        throw new CancelledByClose(); // returned after close() gave up on it
+      } else {
+        await this.followToEnd(resultOrStream.pipe(finalize(end)));
       }
     };
     if (!hooks.onProcessingStartHook) {
@@ -389,6 +466,7 @@ export class AzureServiceBusServer
     receivedMessage: ServiceBusReceivedMessage,
     pattern: string
   ): Promise<void> {
+    const generation = this.generation;
     const partialPacket = { data: receivedMessage, pattern };
     const packet = await this.deserializer.deserialize(partialPacket);
     const receiver = this.receivers.get(pattern)?.receiver;
@@ -412,7 +490,7 @@ export class AzureServiceBusServer
     } catch (err) {
       response$ = throwError(() => err);
     }
-    await this.sendReply(response$, receivedMessage);
+    await this.sendReply(response$, receivedMessage, generation);
   }
 
   /**
@@ -467,9 +545,10 @@ export class AzureServiceBusServer
   }
 
   /**
-   * Stops receiving, waits for the messages being handled (up to
-   * `closeTimeoutInMs`), then closes the receivers and the client. Calls made
-   * while closing share the same work.
+   * Stops receiving, waits for the messages being handled and the responses
+   * still being sent (up to `closeTimeoutInMs`, then unsubscribes them), then
+   * closes the receivers and the client. Calls made while closing share the
+   * same work.
    */
   async close(): Promise<void> {
     if (!this.closing) {
@@ -493,7 +572,7 @@ export class AzureServiceBusServer
     await Promise.all(active.map(({ subscription }) => settled(subscription.close())));
 
     // 2. Let the handlers in flight finish (a drain can still deliver one),
-    //    for up to closeTimeoutInMs.
+    //    for up to closeTimeoutInMs; then their Observables are unsubscribed.
     await this.waitForInFlight();
 
     // 3. Close the links, then the connection.
@@ -511,15 +590,18 @@ export class AzureServiceBusServer
   }
 
   /**
-   * Waits for the handlers in flight, for up to `closeTimeoutInMs`. When that
-   * runs out it logs a warning and returns: closing the receivers then leaves
-   * their messages unsettled, and Service Bus delivers them again once their
-   * lock expires.
+   * Waits for the handlers in flight, and the responses they are still
+   * sending, for up to `closeTimeoutInMs`. When that runs out it unsubscribes
+   * their Observables, stops tracking them (a later close() does not wait for
+   * them again), logs a warning and returns: closing the receivers then leaves
+   * the messages of the handlers still running unsettled, and Service Bus
+   * delivers them again once their lock expires.
    */
   private async waitForInFlight(): Promise<void> {
+    const pending = () => [...this.inFlight, ...this.following.values()];
     const allDone = (async () => {
-      while (this.inFlight.size > 0) {
-        await Promise.all([...this.inFlight].map(settled));
+      for (let work = pending(); work.length > 0; work = pending()) {
+        await Promise.all(work.map(settled));
       }
     })();
     const limit = this.closeTimeoutInMs;
@@ -532,15 +614,47 @@ export class AzureServiceBusServer
     });
     try {
       if (await Promise.race([allDone.then(() => false), timedOut])) {
-        this.logger.warn(
-          `close() waited ${limit} ms (closeTimeoutInMs) and ${this.inFlight.size} handler(s) ` +
-            "are still running. Closing the receivers anyway: those messages are not settled " +
-            "and will be delivered again when their lock expires (peekLock)."
-        );
+        this.giveUpOnInFlight(limit);
       }
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  /** What `waitForInFlight()` does when `closeTimeoutInMs` runs out. */
+  private giveUpOnInFlight(limit: number): void {
+    const handlers = this.inFlight.size;
+    const followed = [...this.following.keys()];
+    // Responses whose request already had its reply: their message was
+    // completed (the others belong to the handlers counted above).
+    const streams = followed.filter((stream) => stream.replied).length;
+    this.generation++;
+    for (const stream of followed) {
+      stream.stop(true);
+    }
+    this.following.clear();
+    this.inFlight.clear();
+
+    const outcome: string[] = [];
+    if (handlers > 0) {
+      outcome.push(
+        `${handlers} message handler(s) still running: their messages are not settled and, ` +
+          "in peekLock mode, Service Bus delivers them again once their lock expires"
+      );
+    }
+    if (streams > 0) {
+      outcome.push(
+        `${streams} streamed response(s) cancelled whose request was already completed: ` +
+          "their clients get no further replies (clients since 1.2.0 fail after their " +
+          "replyTimeoutInMs, if set)"
+      );
+    }
+    this.logger.warn(
+      `close() waited ${limit} ms (closeTimeoutInMs) and closes the receivers anyway; the ` +
+        `Observables of the handlers still running were unsubscribed. ${
+          outcome.length > 0 ? `${outcome.join(". ")}.` : ""
+        }`.trimEnd()
+    );
   }
 
   private track(work: Promise<void>): Promise<void> {
@@ -553,11 +667,36 @@ export class AzureServiceBusServer
     return work;
   }
 
+  /** Keeps `stream` for `close()` until `done` settles. */
+  private watch(stream: FollowedObservable, done: Promise<unknown>): void {
+    this.following.set(stream, done);
+    const forget = () => {
+      this.following.delete(stream);
+    };
+    done.then(forget, forget);
+  }
+
+  /**
+   * Follows the Observable an event handler returned until it completes
+   * (resolves) or errors (rejects). Rejects with `CancelledByClose` if
+   * `close()` gives up on it first.
+   */
+  private followToEnd(source: Observable<unknown>): Promise<void> {
+    let stream: FollowedObservable;
+    const done = new Promise<void>((resolve, reject) => {
+      stream = new FollowedObservable(() => reject(new CancelledByClose()));
+      stream.start(source, { error: reject, complete: () => resolve() });
+    });
+    this.watch(stream, done);
+    return done;
+  }
+
   /**
    * Publishes the handler's response and resolves once its first reply has
    * been sent (or the response ended), so the request message is not settled
    * before the client hears back. The rest of a streamed response goes on in
-   * the background; `close()` waits for it (up to `closeTimeoutInMs`).
+   * the background; `close()` waits for it (up to `closeTimeoutInMs`, then it
+   * unsubscribes it).
    *
    * Clients since 1.2.0 (the request carries `nestjs-sb-request-id`) get one
    * reply per value, each as soon as it is emitted. Values emitted together
@@ -570,12 +709,21 @@ export class AzureServiceBusServer
    * Older clients (1.1.0) take the first message on their reply queue as the
    * whole response, whatever its `correlationId`, so any further reply would
    * reach one of their later requests as its answer. They get exactly one
-   * reply: the first value, the error, or the end of an empty response.
+   * reply: the first value, the error, or the end of an empty response; the
+   * response is unsubscribed after it.
+   *
+   * When a reply cannot be sent, the response is unsubscribed and, for a
+   * client since 1.2.0, an error reply is sent in its place so that the
+   * client does not wait for the rest.
    */
   private async sendReply(
     response$: Observable<unknown>,
-    request: ServiceBusReceivedMessage
+    request: ServiceBusReceivedMessage,
+    generation: number
   ): Promise<void> {
+    if (generation !== this.generation) {
+      throw new CancelledByClose(); // the handler returned after close() gave up on it
+    }
     const { replyTo } = request;
     // Clients since 1.2.0 send their request id in a property, so that a
     // messageId of their own (e.g. for duplicate detection) does not get in
@@ -585,23 +733,32 @@ export class AzureServiceBusServer
     const correlationId = singleReply ? (request.messageId as string) : requestId;
     const publish = this.getPublisher(replyTo, correlationId, request.replyToSessionId);
 
+    let endResponse: () => void;
+    const ended = new Promise<void>((resolve) => (endResponse = resolve));
+    const stream = new FollowedObservable(() => endResponse());
+
     // Replies go out one after another. After a failure the rest are skipped
     // (the client could not make sense of them), and the chain never rejects:
     // a rejection waiting for the end of a long response would be unhandled.
     let publishing: Promise<void> = Promise.resolve();
-    let failure: { err: unknown } | undefined;
+    let failed = false;
     let firstSent: () => void;
     const first = new Promise<void>((resolve) => (firstSent = resolve));
     const respond = (packet: WritePacket) => {
       publishing = publishing.then(async () => {
-        if (failure) return;
+        if (failed) return;
         try {
           await publish(packet);
         } catch (err) {
-          failure = { err };
+          failed = true;
+          stream.stop();
+          await this.replyFailed(err, replyTo, singleReply ? undefined : publish);
         }
       });
-      publishing.then(firstSent);
+      publishing.then(() => {
+        stream.replied = true;
+        firstSent();
+      });
     };
 
     // The replies of the current tick, sent when it ends.
@@ -633,35 +790,63 @@ export class AzureServiceBusServer
       });
     };
 
-    const ended = new Promise<void>((resolve) => {
-      // Resolves after the tick that queues the last replies.
-      const end = () => process.nextTick(resolve);
-      response$.subscribe({
-        next: (response) => schedule({ response }),
-        error: (err) => {
-          schedule({ err: this.toReplyError(err, request), isDisposed: true });
-          end();
-        },
-        complete: () => {
-          schedule({ isDisposed: true });
-          end();
-        },
-      });
-    });
     const finished = (async () => {
       await ended;
       await publishing;
-      if (failure) {
-        // Nothing else can be done with a reply that cannot be sent.
-        const err = failure.err as Error;
-        this.logger.error(
-          `Could not send the reply to ${quote(replyTo)}: ${err?.message ?? err}`,
-          err?.stack
-        );
-      }
     })();
-    this.track(finished);
+    this.watch(stream, finished);
+
+    // Resolves after the tick that queues the last replies.
+    const end = () => process.nextTick(endResponse);
+    // A 1.1.0 client gets a single reply: stop the response after it, so that
+    // nothing goes on running (or holds close()) for replies nobody gets.
+    stream.start(singleReply ? response$.pipe(take(1)) : response$, {
+      next: (response) => schedule({ response }),
+      error: (err) => {
+        schedule({ err: this.toReplyError(err, request), isDisposed: true });
+        end();
+      },
+      complete: () => {
+        schedule({ isDisposed: true });
+        end();
+      },
+    });
     await Promise.race([first, finished]);
+    if (stream.cancelledByClose && !stream.replied) {
+      throw new CancelledByClose(); // no reply: the message must not be completed
+    }
+  }
+
+  /**
+   * Logs a reply that could not be sent and, when `publish` is given (a
+   * client since 1.2.0), sends an error reply in its place: the response was
+   * cut, and without an end the client would wait for the rest.
+   */
+  private async replyFailed(
+    err: unknown,
+    replyTo: string,
+    publish?: (packet: WritePacket) => Promise<void>
+  ): Promise<void> {
+    const failure = `Could not send the reply to ${quote(replyTo)}: ${describeError(err)}.`;
+    const stack = (err as Error)?.stack;
+    if (!publish) {
+      this.logger.error(`${failure} The client gets no reply.`, stack);
+      return;
+    }
+    try {
+      await publish({ err: { ...UNKNOWN_EXCEPTION }, isDisposed: true });
+      this.logger.error(
+        `${failure} The rest of the response was cancelled and the client was sent an error instead.`,
+        stack
+      );
+    } catch (errorReplyErr) {
+      this.logger.error(
+        `${failure} The rest of the response was cancelled, and the error reply could not be sent ` +
+          `either (${describeError(errorReplyErr)}): the client gets no further reply and fails ` +
+          "after its replyTimeoutInMs, if set.",
+        stack
+      );
+    }
   }
 
   /**

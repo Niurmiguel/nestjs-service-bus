@@ -211,9 +211,9 @@ describe(
      * Runs a fixture in its own Node process. Resolves with its exit code, or
      * "timeout" if it is still alive after `ms` (then it is killed).
      */
-    function runChild(fixture, ms) {
+    function runChild(fixture, ms, args = []) {
       const script = fileURLToPath(new URL(fixture, import.meta.url));
-      const child = spawn(process.execPath, [script], {
+      const child = spawn(process.execPath, [script, ...args], {
         env: { ...process.env, SB_EXIT_RUN_ID: runId },
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -959,6 +959,27 @@ describe(
         await client.close();
         await app.close();
       }
+    });
+
+    test("close() cancels an endless response: the process exits on its own", async () => {
+      const started = Date.now();
+      const { code, output } = await runChild("./endless-close.js", 30_000, ["1.2.0"]);
+      assert.equal(code, 0, `child did not exit on its own:\n${output()}`);
+      assert.match(output(), /^first=0$/m, output());
+      // closeTimeoutInMs is 1 s in the child: cut, not waited for.
+      assert.match(output(), /^closed in \d+ ms$/m, output());
+      assert.ok(Date.now() - started < 25_000, `took ${Date.now() - started} ms`);
+    });
+
+    test("a client before 1.2.0: the endless response stops after its single reply", async () => {
+      const { code, output } = await runChild("./endless-close.js", 30_000, ["1.1.0"]);
+      assert.equal(code, 0, `child did not exit on its own:\n${output()}`);
+      assert.match(output(), /^first=0$/m, output());
+      // closeTimeoutInMs is 20 s in this mode: close() must not wait for it.
+      const closedIn = Number(/^closed in (\d+) ms$/m.exec(output())?.[1]);
+      assert.ok(closedIn < 5_000, `close() took ${closedIn} ms:\n${output()}`);
+      assert.match(output(), /^replies=1$/m, output());
+      assert.doesNotMatch(output(), /closeTimeoutInMs/);
     });
 
     test("the process exits on its own after close() (no open handles)", async () => {

@@ -665,6 +665,8 @@ describe(
         connectionString: CONNECTION_STRING,
         allowedReplyTo: ["itest.guarded.reply"],
       });
+      // Leftovers of an earlier (failed) run must not decide this one.
+      await drain("itest.forbidden");
       const { app } = await startMicroservice(controller, { logger, strategy });
       const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
       client.logger = captureLogger();
@@ -701,12 +703,18 @@ describe(
         await client.close();
         await app.close();
       }
-      // Nothing was sent to the entity the request named.
+      // Nothing was sent to the entity the request named (by this run: the
+      // reply would carry the request's messageId as correlationId).
       const forbidden = await withSdk(async (sdk) => {
         const receiver = sdk.createReceiver("itest.forbidden", { receiveMode: "receiveAndDelete" });
-        const got = await receiver.receiveMessages(10, { maxWaitTimeInMs: 2_000 });
+        const got = [];
+        for (let batch; (batch = await receiver.receiveMessages(50, { maxWaitTimeInMs: 2_000 })).length > 0; ) {
+          got.push(...batch);
+        }
         await receiver.close();
-        return got;
+        return got.filter(
+          (m) => m.correlationId === `redirect-${runId}` || m.body?.echoed?.runId === runId
+        );
       });
       assert.deepEqual(forbidden, []);
     });

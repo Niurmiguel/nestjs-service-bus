@@ -24,7 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   run, and in `peekLock` mode it is dead-lettered (`ReplyToNotAllowed`). Not
   set by default.
 - Server option `closeTimeoutInMs`: how long `close()` waits for the handlers
-  that are running (30 seconds by default; see "Behavior changes").
+  that are running (25 seconds by default; see "Behavior changes").
 - Server option `replyTimeToLiveInMs`: time to live of the reply messages. Not
   set by default.
 - Exported from the package root: the errors (`ReplyTimeoutError`,
@@ -192,14 +192,14 @@ Read these before upgrading a service that relies on the 1.1.0 behavior.
   error reply instead of the rest (if that one cannot be sent either, only the
   client's `replyTimeoutInMs` ends its wait).
 - **`close()` of the server** waits for the handlers that are running and the
-  streamed responses they are still sending, for up to `closeTimeoutInMs` (30
-  seconds by default). 1.1.0 did not wait at all. After the time limit the
-  Observables of the handlers still running are unsubscribed and the
-  receivers are closed anyway: in `peekLock` mode the messages of the
-  handlers still running are delivered again once their lock expires, while
-  a streamed response whose request was already completed just ends (its
-  client gets no further replies). Set `closeTimeoutInMs: Infinity` to wait
-  for as long as the handlers take.
+  streamed responses they are still sending, for up to `closeTimeoutInMs` (25
+  seconds by default, under Kubernetes' default 30-second grace period). 1.1.0
+  did not wait at all. After the time limit the Observables of the handlers
+  still running are unsubscribed and the receivers are closed anyway: in
+  `peekLock` mode the messages of the handlers still running are delivered
+  again once their lock expires, while a streamed response whose request was
+  already completed just ends (its client gets no further replies). Set
+  `closeTimeoutInMs: Infinity` to wait for as long as the handlers take.
 - **Replies that are not the client's**: a client that receives a reply to a
   request it did not send abandons it (1.1.0 consumed it, and handed it to the
   wrong caller). With several clients on one reply queue, replies can bounce and
@@ -247,7 +247,7 @@ Read these before upgrading a service that relies on the 1.1.0 behavior.
 4. If you relied on getting `null` from `send()` when the handler failed,
    handle the error of the Observable now. Set `replyTimeoutInMs` on the
    clients, so that a request nobody answers does not wait forever.
-5. If handlers (or streamed responses) can run longer than 30 seconds, review
+5. If handlers (or streamed responses) can run longer than 25 seconds, review
    `closeTimeoutInMs` (and the time your platform gives the process to stop).
 6. If several instances send requests to the same entity, use sessions on
    `<entity>.reply` and set `replySessions: true` on every client. Sessions

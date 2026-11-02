@@ -70,7 +70,7 @@ The server (`new AzureServiceBusServer({...})`) also accepts:
   </tr>
   <tr>
     <td><code>closeTimeoutInMs</code></td>
-    <td>How long <code>close()</code> waits for the handlers that are running and the streamed responses they are still sending. <code>30000</code> (30 seconds) by default; <code>Infinity</code> waits for as long as they take. See <a href="#shutdown">Shutdown</a>.</td>
+    <td>How long <code>close()</code> waits for the handlers that are running and the streamed responses they are still sending. <code>25000</code> (25 seconds) by default; <code>Infinity</code> waits for as long as they take. See <a href="#shutdown">Shutdown</a>.</td>
   </tr>
   <tr>
     <td><code>replyTimeToLiveInMs</code></td>
@@ -308,12 +308,12 @@ While a handler runs in `peekLock` mode, the SDK renews the message's lock for u
 
 Closing the application (`app.close()`) stops receiving new messages, waits for the handlers that are running to finish (and for their messages to be completed), and then closes the receivers and the connection.
 
-It waits for up to `closeTimeoutInMs` (30 seconds by default), including the rest of the streamed responses being sent. When that runs out, the Observables of the handlers still running are unsubscribed, a warning is logged, and the receivers and the connection are closed anyway:
+It waits for up to `closeTimeoutInMs` (25 seconds by default), including the rest of the streamed responses being sent. When that runs out, the Observables of the handlers still running are unsubscribed, a warning is logged, and the receivers and the connection are closed anyway:
 
 - A handler still running has its message left unsettled: in `peekLock` mode Service Bus delivers it again once its lock expires (in `receiveAndDelete` mode it is gone).
 - A streamed response whose request already had its first reply (so its message was completed) just stops: its client gets no further replies and, with `replyTimeoutInMs` set, fails after it.
 
-Make it shorter than the time your platform gives a process to stop (e.g. Kubernetes' `terminationGracePeriodSeconds`, 30 seconds by default), or set `Infinity` to wait for as long as the handlers take.
+The default leaves a few seconds before Kubernetes' default `terminationGracePeriodSeconds` (30 seconds) for the rest of the shutdown. Keep it shorter than the time your platform gives a process to stop, or set `Infinity` to wait for as long as the handlers take.
 
 ## Security
 

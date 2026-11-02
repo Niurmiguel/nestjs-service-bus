@@ -71,8 +71,12 @@ interface ProcessingHooks {
   onProcessingEndHook?: (transportId: unknown, context: unknown) => void;
 }
 
-/** How long `close()` waits for running handlers when not configured. */
-const DEFAULT_CLOSE_TIMEOUT_MS = 30_000;
+/**
+ * How long `close()` waits for running handlers when not configured: less than
+ * the 30 s a platform such as Kubernetes gives a process to stop by default,
+ * so that close() can finish before the process is killed.
+ */
+const DEFAULT_CLOSE_TIMEOUT_MS = 25_000;
 
 /** Dead-letter reason of a request whose `replyTo` is not allowed. */
 const REPLY_TO_NOT_ALLOWED = "ReplyToNotAllowed";

@@ -48,8 +48,9 @@ export interface AzureServiceBusServerOptions extends AzureServiceBusOptions {
    * Bus delivers them again once their lock expires; a streamed response whose
    * request was already completed just ends without further replies.
    *
-   * - **Default**: `30000` (30 seconds). `Infinity` waits for as long as the
-   *   handlers take; `0` does not wait.
+   * - **Default**: `25000` (25 seconds, under the 30 seconds Kubernetes gives
+   *   a pod to stop by default). `Infinity` waits for as long as the handlers
+   *   take; `0` does not wait.
    */
   closeTimeoutInMs?: number;
   /**

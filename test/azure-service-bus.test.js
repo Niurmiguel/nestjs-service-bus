@@ -1614,8 +1614,8 @@ test("server close() stops waiting for handlers after closeTimeoutInMs and close
   }
 });
 
-test("server close() waits 30 s by default, and for ever with Infinity", () => {
-  assert.equal(new AzureServiceBusServer({ connectionString: CONNECTION_STRING }).closeTimeoutInMs, 30_000);
+test("server close() waits 25 s by default, and for ever with Infinity", () => {
+  assert.equal(new AzureServiceBusServer({ connectionString: CONNECTION_STRING }).closeTimeoutInMs, 25_000);
   assert.equal(
     new AzureServiceBusServer({ connectionString: CONNECTION_STRING, closeTimeoutInMs: Infinity }).closeTimeoutInMs,
     Infinity

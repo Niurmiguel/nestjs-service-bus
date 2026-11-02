@@ -1,24 +1,16 @@
-import {
-  MetaOrMetaFactory,
-  SbSubscriberMetadataOptions,
-  SbSubscriberTypeMap,
-} from '../interfaces';
+import { MetaOrMetaFactory, SbSubscriberTypeMap } from '../interfaces';
 
 export class SbSubscriberMetadata<
   T extends keyof SbSubscriberTypeMap = keyof SbSubscriberTypeMap,
 > {
-  metaOptions: SbSubscriberTypeMap[T] extends SbSubscriberMetadataOptions
-    ? SbSubscriberTypeMap[T]
-    : SbSubscriberMetadataOptions;
+  metaOptions: SbSubscriberTypeMap[T];
   private metaFactory?: (
     helper?: any,
   ) => SbSubscriberTypeMap[T] | Promise<SbSubscriberTypeMap[T]>;
 
   constructor(
     public readonly type: T,
-    metaOptions: SbSubscriberTypeMap[T] extends SbSubscriberMetadataOptions
-      ? MetaOrMetaFactory<SbSubscriberTypeMap[T]>
-      : never,
+    metaOptions: MetaOrMetaFactory<SbSubscriberTypeMap[T]>,
   ) {
     if (typeof metaOptions === 'function') {
       this.metaFactory = metaOptions as any;

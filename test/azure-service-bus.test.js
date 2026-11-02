@@ -197,30 +197,187 @@ test("server.bindEvents opens one receiver per subscription", async () => {
   assert.equal(receivers[0].subscribed, true);
 });
 
-test(
-  "server.bindEvents keeps receivers open while listening",
-  { todo: "bindEvents() closes each receiver right after subscribe(); see PR #205" },
-  async () => {
-    const server = new AzureServiceBusServer({ connectionString: CONNECTION_STRING });
-    let closed = false;
-    server.sbClient = {
-      createReceiver: () => ({
-        subscribe: () => ({ close: async () => {} }),
-        close: async () => {
-          closed = true;
+function fakeServiceBusClient() {
+  const calls = { receivers: [], closed: false };
+  calls.client = {
+    createReceiver: (...args) => {
+      const receiver = {
+        args,
+        receiveMode: "peekLock",
+        subscribeOptions: undefined,
+        subscriptionClosed: false,
+        closed: false,
+        subscribe(handlers, options) {
+          receiver.handlers = handlers;
+          receiver.subscribeOptions = options;
+          return {
+            close: async () => {
+              receiver.subscriptionClosed = true;
+            },
+          };
         },
-      }),
-    };
-    server.addHandler(
-      { type: "subscription", metaOptions: { topic: "t", subscription: "s" } },
-      async () => {},
-      true
-    );
+        async close() {
+          receiver.closed = true;
+        },
+      };
+      calls.receivers.push(receiver);
+      return receiver;
+    },
+    async close() {
+      calls.closed = true;
+    },
+  };
+  return calls;
+}
 
-    await server.bindEvents();
-    assert.equal(closed, false);
+function serverWith(fake, ...patterns) {
+  const server = new AzureServiceBusServer({ connectionString: CONNECTION_STRING });
+  server.createServiceBusClient = () => fake.client;
+  for (const pattern of patterns) server.addHandler(pattern, async () => {}, true);
+  return server;
+}
+
+const listen = (server) =>
+  new Promise((resolve, reject) => server.listen((err) => (err ? reject(err) : resolve())));
+
+test("server keeps receivers open while listening and closes them in close()", async () => {
+  const fake = fakeServiceBusClient();
+  const server = serverWith(fake, {
+    type: "subscription",
+    metaOptions: { topic: "t", subscription: "s", receiveMode: "peekLock" },
+  });
+
+  await listen(server);
+  const [receiver] = fake.receivers;
+  assert.equal(receiver.closed, false);
+  assert.equal(receiver.subscriptionClosed, false);
+  assert.equal(server.receivers.size, 1);
+
+  await server.close();
+  assert.equal(receiver.subscriptionClosed, true);
+  assert.equal(receiver.closed, true);
+  assert.equal(fake.closed, true);
+  assert.equal(server.receivers.size, 0);
+  assert.throws(() => server.unwrap(), /Not initialized/);
+});
+
+test("server uses the queue overload of createReceiver for @Queue", async () => {
+  const fake = fakeServiceBusClient();
+  const server = serverWith(fake, {
+    type: "queue",
+    metaOptions: {
+      queueName: "jobs",
+      receiveMode: "receiveAndDelete",
+      subQueueType: "deadLetter",
+      skipParsingBodyAsJson: true,
+    },
+  });
+
+  await listen(server);
+  // Two arguments: a non-string second argument is read as the options, so
+  // passing (queue, null, options) would silently drop them.
+  assert.deepEqual(fake.receivers[0].args, [
+    "jobs",
+    { receiveMode: "receiveAndDelete", subQueueType: "deadLetter", skipParsingBodyAsJson: true },
+  ]);
+  await server.close();
+});
+
+test("server keeps reading @Subscription without a subscription name as a queue", async () => {
+  const fake = fakeServiceBusClient();
+  const server = serverWith(fake, {
+    type: "subscription",
+    metaOptions: { topic: "legacy-queue", receiveMode: "receiveAndDelete" },
+  });
+
+  await listen(server);
+  assert.equal(fake.receivers[0].args.length, 2);
+  assert.equal(fake.receivers[0].args[0], "legacy-queue");
+  assert.equal(fake.receivers[0].args[1].receiveMode, "receiveAndDelete");
+  await server.close();
+});
+
+test("server subscribes with its own completion and an abort signal", async () => {
+  const fake = fakeServiceBusClient();
+  const server = serverWith(fake, {
+    type: "queue",
+    metaOptions: { queueName: "q", receiveMode: "peekLock", options: { maxConcurrentCalls: 4 } },
+  });
+
+  await listen(server);
+  const options = fake.receivers[0].subscribeOptions;
+  assert.equal(options.maxConcurrentCalls, 4);
+  assert.equal(options.autoCompleteMessages, false);
+  assert.equal(options.abortSignal.aborted, false);
+  await server.close();
+  assert.equal(options.abortSignal.aborted, true);
+});
+
+test("a second listen() reuses the client and the receivers", async () => {
+  const fake = fakeServiceBusClient();
+  let clients = 0;
+  const server = serverWith(fake, { type: "queue", metaOptions: { queueName: "q" } });
+  server.createServiceBusClient = () => {
+    clients++;
+    return fake.client;
+  };
+
+  await listen(server);
+  await listen(server);
+  assert.equal(clients, 1);
+  assert.equal(fake.receivers.length, 1);
+  await server.close();
+});
+
+test("a failed listen() closes what it opened and reports the error", async () => {
+  const fake = fakeServiceBusClient();
+  const server = serverWith(
+    fake,
+    { type: "queue", metaOptions: { queueName: "ok" } },
+    "not-a-service-bus-pattern"
+  );
+
+  await assert.rejects(listen(server), /not-a-service-bus-pattern/);
+  assert.equal(fake.receivers[0].closed, true);
+  assert.equal(fake.closed, true);
+});
+
+test("server processError resolves (the SDK awaits it)", async () => {
+  const server = new AzureServiceBusServer({ connectionString: CONNECTION_STRING });
+  const logged = [];
+  server.logger = { error: (...args) => logged.push(args) };
+  const { processError } = server.createMessageHandlers("p");
+
+  const result = await Promise.race([
+    processError({ error: new Error("boom"), errorSource: "receive", entityPath: "q" }).then(
+      () => "resolved"
+    ),
+    new Promise((resolve) => setTimeout(resolve, 200, "pending").unref()),
+  ]);
+  assert.equal(result, "resolved");
+  assert.match(String(logged[0][0]), /receive error on "q": boom/);
+});
+
+test("server completes peekLock messages after the handler unless told not to", async () => {
+  for (const [options, expected] of [
+    [{}, 1],
+    [{ autoCompleteMessages: false }, 0],
+  ]) {
+    const fake = fakeServiceBusClient();
+    const server = serverWith(fake, {
+      type: "queue",
+      metaOptions: { queueName: "q", receiveMode: "peekLock", options },
+    });
+    await listen(server);
+    const receiver = fake.receivers[0];
+    const completed = [];
+    receiver.completeMessage = async (message) => completed.push(message);
+
+    await receiver.handlers.processMessage({ body: {}, messageId: "m" });
+    assert.equal(completed.length, expected, JSON.stringify(options));
+    await server.close();
   }
-);
+});
 
 test("the context exposes the receiver and the message", () => {
   const receiver = {};

@@ -21,6 +21,7 @@
   },
   "homepage": "https://github.com/Niurmiguel/nestjs-service-bus#readme",
   "peerDependencies": {
+    "@azure/service-bus": "^7.9.0",
     "@nestjs/common": "^10.0.4 || ^11.0.0",
     "@nestjs/core": "^10.0.4 || ^11.0.0",
     "@nestjs/microservices": "^10.0.4 || ^11.0.0",

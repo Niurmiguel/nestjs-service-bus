@@ -10,13 +10,15 @@ permissions:
 
 jobs:
   build-and-test:
-    name: Node ${{ matrix.node }} / NestJS ${{ matrix.nest }}
+    name: Node ${{ matrix.node }} / NestJS ${{ matrix.nest }} / service-bus ${{ matrix.service-bus }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         node: ["22.x", "24.x"]
         nest: ["10", "11"]
+        # Lowest version of the peer range, and the latest release.
+        service-bus: ["7.9.0", "latest"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -24,20 +26,27 @@ jobs:
           node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
-      # devDependencies pin NestJS 11; swap in 10 to check the other peer range.
-      - name: Install NestJS ${{ matrix.nest }}
-        if: matrix.nest != '11'
-        run: npm install --no-save @nestjs/common@^${{ matrix.nest }} @nestjs/core@^${{ matrix.nest }} @nestjs/microservices@^${{ matrix.nest }}
+      # One install: a second `npm install --no-save` would undo the first.
+      - name: Install NestJS ${{ matrix.nest }} and @azure/service-bus ${{ matrix.service-bus }}
+        run: npm install --no-save "@azure/service-bus@$SERVICE_BUS" $NEST
+        env:
+          SERVICE_BUS: ${{ matrix.service-bus }}
+          # devDependencies pin NestJS 11; swap in 10 to check the other peer range.
+          NEST: ${{ matrix.nest != '11' && format('@nestjs/common@^{0} @nestjs/core@^{0} @nestjs/microservices@^{0}', matrix.nest) || '' }}
+      # npm test compiles against the installed versions, then runs the tests.
       - run: npm test
 
   integration:
-    name: Emulator / NestJS ${{ matrix.nest }}
+    name: Emulator / NestJS ${{ matrix.nest }} / service-bus ${{ matrix.service-bus }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         nest: ["10", "11"]
+        # 7.9.5 is the first release that can connect to the emulator
+        # (UseDevelopmentEmulator); the unit tests cover 7.9.0.
+        service-bus: ["7.9.5", "latest"]
     env:
       # LICENSES: ACCEPT_EULA=Y accepts, for this run, the Microsoft license
       # terms of the Azure Service Bus emulator
@@ -62,9 +71,11 @@ jobs:
           export MSSQL_SA_PASSWORD
           docker compose -f test/integration/docker-compose.yml up -d
       - run: npm ci
-      - name: Install NestJS ${{ matrix.nest }}
-        if: matrix.nest != '11'
-        run: npm install --no-save @nestjs/common@^${{ matrix.nest }} @nestjs/core@^${{ matrix.nest }} @nestjs/microservices@^${{ matrix.nest }}
+      - name: Install NestJS ${{ matrix.nest }} and @azure/service-bus ${{ matrix.service-bus }}
+        run: npm install --no-save "@azure/service-bus@$SERVICE_BUS" $NEST
+        env:
+          SERVICE_BUS: ${{ matrix.service-bus }}
+          NEST: ${{ matrix.nest != '11' && format('@nestjs/common@^{0} @nestjs/core@^{0} @nestjs/microservices@^{0}', matrix.nest) || '' }}
       - name: Wait for the emulator
         run: |
           for i in $(seq 1 60); do

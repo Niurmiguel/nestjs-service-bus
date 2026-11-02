@@ -1136,3 +1136,31 @@ test("the published typings do not import @azure/core-amqp (not a dependency)", 
   }
 });
 
+
+test("every package the published code and typings import is a declared peer dependency", () => {
+  const { readdirSync, readFileSync } = require("node:fs");
+  const { builtinModules } = require("node:module");
+  const path = require("node:path");
+  const pkg = require("../package.json");
+  const declared = new Set([
+    ...Object.keys(pkg.peerDependencies ?? {}),
+    ...Object.keys(pkg.dependencies ?? {}),
+  ]);
+  const dist = path.join(__dirname, "..", "dist");
+  const files = readdirSync(dist, { recursive: true }).filter(
+    (f) => f.endsWith(".js") || f.endsWith(".d.ts")
+  );
+  const undeclared = new Set();
+  for (const file of files) {
+    const source = readFileSync(path.join(dist, file), "utf8");
+    const specifiers = source.matchAll(/(?:require\(|from\s+|import\()["']([^"'.][^"']*)["']/g);
+    for (const [, specifier] of specifiers) {
+      const name = specifier.startsWith("@")
+        ? specifier.split("/").slice(0, 2).join("/")
+        : specifier.split("/")[0];
+      if (builtinModules.includes(name.replace(/^node:/, ""))) continue;
+      if (!declared.has(name)) undeclared.add(`${name} (${file})`);
+    }
+  }
+  assert.deepEqual([...undeclared], []);
+});

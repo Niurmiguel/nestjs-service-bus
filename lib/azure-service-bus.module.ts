@@ -5,7 +5,6 @@ import {
   OnApplicationShutdown,
   Provider,
 } from "@nestjs/common";
-import { ClientProxy, Closeable } from "@nestjs/microservices";
 
 import { AzureServiceBusClient } from "./client";
 import {
@@ -100,7 +99,7 @@ export class AzureServiceBusModule {
     };
   }
 
-  private static assignOnAppShutdownHook(client: ClientProxy & Closeable) {
+  private static assignOnAppShutdownHook(client: AzureServiceBusClient) {
     (client as unknown as OnApplicationShutdown).onApplicationShutdown =
       client.close;
     return client;

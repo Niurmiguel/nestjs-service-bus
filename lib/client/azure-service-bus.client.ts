@@ -146,6 +146,16 @@ export class AzureServiceBusClient extends AzureServiceBusClientProxy {
     return new ServiceBusClient(connectionString, options);
   }
 
+  /**
+   * Returns the underlying `ServiceBusClient` (NestJS 11+ API).
+   */
+  unwrap<T = ServiceBusClient>(): T {
+    if (!this.sbClient) {
+      throw new Error('Not initialized. Please call the "connect" method first.');
+    }
+    return this.sbClient as T;
+  }
+
   async close(): Promise<void> {
     await this.sbClient?.close();
   }

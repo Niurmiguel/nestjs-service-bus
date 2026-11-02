@@ -123,6 +123,25 @@ export class AzureServiceBusServer
     return new ServiceBusClient(connectionString, options);
   }
 
+  /**
+   * Returns the underlying `ServiceBusClient` (NestJS 11+ API).
+   */
+  unwrap<T = ServiceBusClient>(): T {
+    if (!this.sbClient) {
+      throw new Error(
+        'Not initialized. Please call the "listen"/"startAllMicroservices" method before accessing the server.'
+      );
+    }
+    return this.sbClient as T;
+  }
+
+  /**
+   * Status/event listeners (NestJS 11+ API) are not supported by this transport.
+   */
+  on(_event: string, _callback: unknown): never {
+    throw new Error("Method not implemented.");
+  }
+
   async close(): Promise<void> {
     await this.sbClient?.close();
   }

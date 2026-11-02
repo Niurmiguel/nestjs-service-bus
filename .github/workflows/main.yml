@@ -1,22 +1,31 @@
 name: Publish Package to npmjs
 on:
   release:
-    types: [created]
+    # Not "created": that also fires when a draft release is saved.
+    types: [published]
 permissions:
   contents: read
 jobs:
-  build:
+  publish:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # npm provenance: lets npm verify this workflow built the package.
+      id-token: write
     steps:
-      - uses: actions/checkout@v7
-      # Setup .npmrc file to publish to npm
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Writes the .npmrc that reads NODE_AUTH_TOKEN.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "24.x"
           registry-url: "https://registry.npmjs.org"
-      - run: npm ci
+      # No dependency needs an install script; none runs with the token around.
+      - run: npm ci --ignore-scripts
       - run: npm test
+      - run: npm run check:pack
       # `prepack` builds dist/ before packing.
-      - run: npm publish
+      - run: npm publish --provenance
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

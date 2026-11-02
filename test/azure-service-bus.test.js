@@ -37,6 +37,60 @@ function fakeSender() {
   return sender;
 }
 
+/**
+ * A fake ServiceBusClient for the client side: records the senders and the
+ * reply receivers, and lets a test deliver replies through `processMessage`.
+ */
+function fakeClientSdk({ sendMessages } = {}) {
+  const sdk = { senders: [], receivers: [], closed: false };
+  sdk.createSender = (name) => {
+    const sender = fakeSender();
+    sender.name = name;
+    if (sendMessages) sender.sendMessages = (...args) => sendMessages(sender, ...args);
+    sdk.senders.push(sender);
+    return sender;
+  };
+  sdk.createReceiver = (entity, options) => {
+    const receiver = {
+      entity,
+      options,
+      closed: false,
+      completed: [],
+      abandoned: [],
+      subscribe(handlers, subscribeOptions) {
+        receiver.handlers = handlers;
+        receiver.subscribeOptions = subscribeOptions;
+        return { close: async () => {} };
+      },
+      async completeMessage(message) {
+        receiver.completed.push(message);
+      },
+      async abandonMessage(message) {
+        receiver.abandoned.push(message);
+      },
+      async close() {
+        receiver.closed = true;
+      },
+    };
+    sdk.receivers.push(receiver);
+    return receiver;
+  };
+  sdk.close = async () => {
+    sdk.closed = true;
+  };
+  return sdk;
+}
+
+/** Lets pending promise callbacks and I/O callbacks run `n` times. */
+async function ticks(n = 10) {
+  for (let i = 0; i < n; i++) await new Promise((resolve) => setImmediate(resolve));
+}
+
+function silentLogger(logged = []) {
+  const push = (level) => (...args) => logged.push({ level, args });
+  return { error: push("error"), warn: push("warn"), log: push("log"), debug: push("debug"), verbose() {} };
+}
+
 test("forRoot registers one closable client provider per entry", () => {
   const mod = AzureServiceBusModule.forRoot([
     { name: "SB_A", connectionString: CONNECTION_STRING },
@@ -184,6 +238,71 @@ test("client.emit with a subscriber gives it the error instead of logging it", a
 
   await assert.rejects(lastValueFrom(client.emit({ name: "missing" }, { body: 1 })), /entity not found/);
   assert.deepEqual(logged, []);
+});
+
+test("client.send errors the Observable when the send fails", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  client.sbClient = fakeClientSdk({
+    sendMessages: async () => {
+      throw Object.assign(new Error("The messaging entity could not be found"), {
+        code: "MessagingEntityNotFound",
+      });
+    },
+  });
+
+  await assert.rejects(lastValueFrom(client.send({ name: "missing" }, { body: 1 })), {
+    code: "MessagingEntityNotFound",
+  });
+  await ticks();
+  assert.equal(client.sbClient.senders[0].closed, true);
+});
+
+test("client.close waits for the sends in flight", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  let finishSend;
+  const sdk = fakeClientSdk({
+    sendMessages: () => new Promise((resolve) => (finishSend = resolve)),
+  });
+  client.sbClient = sdk;
+  client.logger = silentLogger();
+
+  client.emit({ name: "orders" }, { body: 1 }).subscribe({ error: () => {} });
+  await ticks();
+  let closed = false;
+  const closing = client.close().then(() => (closed = true));
+  await ticks();
+  assert.equal(closed, false, "close() resolved with a send in flight");
+  assert.equal(sdk.closed, false);
+
+  finishSend();
+  await closing;
+  assert.equal(sdk.senders[0].closed, true);
+  assert.equal(sdk.closed, true);
+});
+
+test("a receiver that fails to close is logged, not left as an unhandled rejection", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  const logged = [];
+  client.logger = silentLogger(logged);
+  const sdk = fakeClientSdk();
+  const createReceiver = sdk.createReceiver;
+  sdk.createReceiver = (...args) => {
+    const receiver = createReceiver(...args);
+    receiver.close = async () => {
+      throw new Error("link detach failed");
+    };
+    return receiver;
+  };
+  client.sbClient = sdk;
+
+  const subscription = client.send({ name: "orders" }, { body: 1 }).subscribe({ error: () => {} });
+  await ticks();
+  subscription.unsubscribe();
+  await client.close();
+  assert.ok(
+    logged.some((e) => e.level === "error" && /link detach failed/.test(String(e.args[0]))),
+    JSON.stringify(logged)
+  );
 });
 
 test("client.emit rejects a missing pattern or payload", async () => {

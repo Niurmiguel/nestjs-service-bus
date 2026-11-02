@@ -1,8 +1,7 @@
 "use strict";
 // Child process for the request-response integration test. It runs in its own
-// process because the client side of send() leaves a send pending after
-// close() (see the `todo` test that checks this process exits): in the main
-// test process it would keep the suite from finishing, and later crash it.
+// process so that the parent can check that it exits on its own once the
+// client and the microservice are closed (nothing left pending after close()).
 const { lastValueFrom } = require("rxjs");
 
 const { AzureServiceBusClient, AzureServiceBusContext, Queue } = require("../../dist");

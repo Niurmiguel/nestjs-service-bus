@@ -235,19 +235,28 @@ describe(
       assert.match(output(), /^closed$/m, output());
     });
 
-    test(
-      "send(): the process exits on its own after close()",
-      {
-        todo:
-          "publish() in the client does not await sendMessages() nor the closes in its " +
-          "teardown: the send keeps retrying on a closed sender, holds the process " +
-          "open and ends as an unhandled rejection (~90 s on the emulator)",
-      },
-      async () => {
-        const { code, output } = await requestReply;
-        assert.equal(code, 0, output());
+    test("send(): the process exits on its own after close()", async () => {
+      const { code, output } = await requestReply;
+      assert.equal(code, 0, output());
+    });
+
+    test("send() to an entity that does not exist errors the Observable", async () => {
+      const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+      try {
+        const outcome = await Promise.race([
+          firstValueFrom(client.send({ name: "itest.does-not-exist" }, { body: { runId } })).then(
+            (value) => ({ value }),
+            (error) => ({ error })
+          ),
+          timeoutAfter(20_000),
+        ]);
+        assert.notEqual(outcome, "timeout", "send() neither replied nor failed");
+        assert.ok(outcome.error, `expected an error, got ${JSON.stringify(outcome)}`);
+        assert.equal(outcome.error.code, "MessagingEntityNotFound");
+      } finally {
+        await client.close();
       }
-    );
+    });
 
     test("peekLock: the context exposes the receiver to abandon and complete", async () => {
       const deliveries = [];

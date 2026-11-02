@@ -4,6 +4,8 @@ import {
   ServiceBusClient,
   ServiceBusMessage,
   ServiceBusReceivedMessage,
+  ServiceBusReceiver,
+  ServiceBusSender,
 } from "@azure/service-bus";
 
 import { PacketId, ReadPacket, WritePacket } from "@nestjs/microservices";
@@ -39,6 +41,8 @@ function readSenderOptions(pattern: unknown): AzureServiceBusSenderOptions {
 @Injectable()
 export class AzureServiceBusClient extends AzureServiceBusClientProxy {
   private sbClient: ServiceBusClient;
+  /** Sends and receiver closes in progress, which `close()` waits for. */
+  private readonly inFlight = new Set<Promise<unknown>>();
 
   constructor(protected readonly options: AzureServiceBusOptions) {
     super();
@@ -60,10 +64,7 @@ export class AzureServiceBusClient extends AzureServiceBusClientProxy {
   ): Promise<any> {
     const { name, options } = readSenderOptions(packet.pattern);
     const messages = this.serializer.serialize(packet.data);
-
-    const sender = this.sbClient.createSender(name);
-    await sender.sendMessages(messages, options);
-    await sender.close();
+    await this.sendTo(name, messages, options);
   }
 
   protected publish(
@@ -75,7 +76,6 @@ export class AzureServiceBusClient extends AzureServiceBusClientProxy {
       const { name, options } = readSenderOptions(packet.pattern);
       const serializedPacket = this.serializer.serialize(packet.data);
       const replyTo = this.getReplyTo(name);
-      const sender = this.sbClient.createSender(name);
       const receiver = this.sbClient.createReceiver(replyTo);
 
       let messages = [
@@ -96,26 +96,75 @@ export class AzureServiceBusClient extends AzureServiceBusClientProxy {
 
       this.routingMap.set(packet.id, callback);
 
-      sender.sendMessages(messages, options);
+      // Without an abort signal, subscribe() keeps retrying after close().
+      const abortController = new AbortController();
+      const subscription = receiver.subscribe(this.createMessageHandlers(packet, receiver), {
+        abortSignal: abortController.signal,
+        // Settled before the callback runs (see createMessageHandlers()): the
+        // callback can end the request and close this receiver, which would
+        // leave the SDK's own completion hanging on a closed link.
+        autoCompleteMessages: false,
+      });
 
-      if (replyTo) {
-        receiver.subscribe(this.createMessageHandlers(packet));
-      }
+      // A failed send (e.g. the entity does not exist) errors the Observable.
+      this.sendTo(name, messages, options).catch((err) => callback({ err }));
 
       return () => {
-        sender.close();
-        receiver.close();
         this.routingMap.delete(packet.id);
+        abortController.abort();
+        this.track(subscription.close().then(() => receiver.close())).catch((err) =>
+          this.logger.error(
+            `Could not close the reply receiver for "${replyTo}": ${err?.message ?? err}`,
+            err?.stack
+          )
+        );
       };
     } catch (err) {
       callback({ err });
     }
   }
 
+  /**
+   * Sends through a short-lived sender. `close()` waits for it, and a failure
+   * to close the sender is logged rather than left as an unhandled rejection.
+   */
+  private sendTo(
+    name: string,
+    messages: Parameters<ServiceBusSender["sendMessages"]>[0],
+    options: AzureServiceBusSenderOptions["options"]
+  ): Promise<void> {
+    const sending = (async () => {
+      const sender = this.sbClient.createSender(name);
+      try {
+        await sender.sendMessages(messages, options);
+      } finally {
+        await sender.close().catch((err) =>
+          this.logger.error(
+            `Could not close the sender for "${name}": ${err?.message ?? err}`,
+            err?.stack
+          )
+        );
+      }
+    })();
+    return this.track(sending);
+  }
+
+  /** Remembers `work` until it settles, so that `close()` can wait for it. */
+  private track<T>(work: Promise<T>): Promise<T> {
+    this.inFlight.add(work);
+    const forget = () => {
+      this.inFlight.delete(work);
+    };
+    work.then(forget, forget);
+    return work;
+  }
+
   public createMessageHandlers = (
-    packet: ReadPacket<any> & PacketId
+    packet: ReadPacket<any> & PacketId,
+    receiver?: ServiceBusReceiver
   ): MessageHandlers => ({
     processMessage: async (receivedMessage: ServiceBusReceivedMessage) => {
+      await receiver?.completeMessage(receivedMessage);
       await this.handleMessage(receivedMessage, packet);
     },
     processError: async (args: ProcessErrorArgs): Promise<void> => {
@@ -171,7 +220,16 @@ export class AzureServiceBusClient extends AzureServiceBusClientProxy {
     return this.sbClient as T;
   }
 
+  /**
+   * Waits for the sends in flight (and for the reply receivers being closed),
+   * then closes the connection. A later `send()`/`emit()` connects again.
+   */
   async close(): Promise<void> {
-    await this.sbClient?.close();
+    while (this.inFlight.size > 0) {
+      await Promise.allSettled([...this.inFlight]);
+    }
+    const client = this.sbClient;
+    this.sbClient = undefined;
+    await client?.close();
   }
 }

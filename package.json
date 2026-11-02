@@ -6,7 +6,7 @@
   "types": "dist/index",
   "scripts": {
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
-    "prepublish": "npm run build",
+    "prepack": "npm run build",
     "test": "npm run build && node --test test/azure-service-bus.test.js"
   },
   "repository": {

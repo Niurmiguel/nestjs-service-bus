@@ -786,10 +786,12 @@ describe(
         const replies = await withSdk(async (sdk) => {
           const receiver = sdk.createReceiver("itest.stream.reply", { receiveMode: "receiveAndDelete" });
           const sender = sdk.createSender("itest.stream");
+          // As a 1.2.0 client sends it: older clients get a single reply.
           await sender.sendMessages({
             body: { runId, kind: "progress" },
             messageId: `ttl-${runId}`,
             replyTo: "itest.stream.reply",
+            applicationProperties: { "nestjs-sb-request-id": `ttl-${runId}` },
           });
           await sender.close();
           const got = [];
@@ -810,6 +812,38 @@ describe(
           ]
         );
         for (const reply of replies) assert.equal(reply.timeToLive, 120_000);
+      } finally {
+        await app.close();
+      }
+    });
+
+    test("a request from a client before 1.2.0 gets a single reply", async () => {
+      // 1.1.0 clients send no nestjs-sb-request-id, and take any message on
+      // their reply queue as the answer to their next request.
+      const { app } = await startMicroservice(streamController());
+      try {
+        const replies = await withSdk(async (sdk) => {
+          const receiver = sdk.createReceiver("itest.stream.reply", { receiveMode: "receiveAndDelete" });
+          const sender = sdk.createSender("itest.stream");
+          await sender.sendMessages({
+            body: { runId, kind: "progress" },
+            messageId: `legacy-${runId}`,
+            replyTo: "itest.stream.reply",
+          });
+          await sender.close();
+          const got = [];
+          // The whole stream takes 600 ms: wait well past its end.
+          for (let i = 0; i < 4; i++) {
+            const batch = await receiver.receiveMessages(5, { maxWaitTimeInMs: 1_000 });
+            got.push(...batch.filter((m) => m.correlationId === `legacy-${runId}`));
+          }
+          await receiver.close();
+          return got;
+        });
+        assert.deepEqual(
+          replies.map((r) => [r.body, r.applicationProperties["nestjs-sb-is-disposed"]]),
+          [["10%", true]]
+        );
       } finally {
         await app.close();
       }

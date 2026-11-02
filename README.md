@@ -27,6 +27,8 @@ To start building Azure Service Bus-based microservices, first install the requi
 ```bash
 $ npm i --save @azure/service-bus @niur/nestjs-service-bus
 ```
+
+`@azure/service-bus` (7.9.0 or later), NestJS 10 or 11, `reflect-metadata` and `rxjs` are peer dependencies: the application provides them.
 #### Overview
 
 To use the Azure Service Bus strategy, pass the following options object to the `createMicroservice()` method:
@@ -106,16 +108,31 @@ constructor(
 
 ```
 
+##### Client options
+
+Besides `connectionString` and `options`, each client (an entry of `forRoot()`/`forRootAsync()`, or `new AzureServiceBusClient({...})`) accepts:
+
+<table>
+  <tr>
+    <td><code>replyTimeoutInMs</code></td>
+    <td>How long a <code>send()</code> waits for its reply to complete before its Observable fails with a <code>ReplyTimeoutError</code>. Not set by default: <code>send()</code> waits indefinitely.</td>
+  </tr>
+  <tr>
+    <td><code>replySessions</code></td>
+    <td>Receive the replies in a session of this client's own. Use it when several clients (e.g. several replicas of a service) send requests to the same entity: see <a href="#request-response">Request-response</a>. Default <code>false</code>.</td>
+  </tr>
+</table>
+
 ##### Producer
 
-Event-based
+Message-based (request-response)
 
 ```typescript
 
 const pattern = {
-  name: 'sample-topic', // topic name
-  options: {}
-}; // queue name
+  name: 'sample-queue', // queue or topic name
+  options: {}, // passed to sendMessages(), e.g. { abortSignal }
+};
 const data = {
   body: 'Example message'
 };
@@ -126,20 +143,31 @@ this.sbClient.send(pattern, data).subscribe((response) => {
 
 ```
 
-Message-based
+Event-based
 
 ```typescript
 
 const pattern = {
-  name: 'sample-topic', // topic name
+  name: 'sample-topic', // queue or topic name
   options: {}
-}; // queue name
+};
 const data = {
   body: 'Example message'
 };
 this.sbClient.emit(pattern, data);
 ```
 
+`emit()` sends right away. If nobody subscribes to the Observable it returns, a failed send is logged.
+
+##### Request-response
+
+`send()` sends the request to `name` and waits for the reply on the queue `<name>.reply`, which must exist. The server answers there with one message per value of the handler's response; the client matches each reply to its request by `correlationId`, so concurrent `send()` calls each get their own reply.
+
+- If the handler fails, the Observable fails with the error Nest's exception filter makes of it, as in Nest's other transports: `{ status: 'error', message: 'Internal server error' }` for an unknown error, or the payload of an `RpcException`.
+- If the request cannot be sent (e.g. the entity does not exist), or the reply queue does not exist, the Observable fails.
+- `close()` waits for the sends in flight and fails the `send()` calls still waiting for a reply.
+
+When several clients send to the same entity they share `<name>.reply`. Without sessions, a client that receives a reply to a request it did not send abandons it, so that Service Bus delivers it again, possibly to the client it belongs to; a reply can bounce several times, and after the queue's max delivery count it is dead-lettered. For several clients, enable sessions on the reply queue and set `replySessions: true` on every client: each client then receives only the replies sent to its own session. The servers must run 1.2.0 or later (they send the reply to the session the request names).
 
 ##### Consumer
 
@@ -235,6 +263,8 @@ async getMessages(
 `context.getMessage()` returns the same message the handler gets as payload.
 
 If the handler throws (or returns an Observable that errors) and has not settled the message, the message is abandoned: Service Bus delivers it again, and after the entity's max delivery count moves it to the dead-letter queue. In `receiveAndDelete` mode the message is already gone, so the error is only logged. A handler that returns an Observable has its message completed when that Observable completes.
+
+While a handler runs in `peekLock` mode, the SDK renews the message's lock for up to `maxAutoLockRenewalDurationInMs` (5 minutes by default; `0` turns renewal off). A handler that outlasts the lock without renewal loses it: the message cannot be completed and is delivered again.
 
 ##### Shutdown
 

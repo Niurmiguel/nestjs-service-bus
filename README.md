@@ -193,6 +193,59 @@ Options
 
 
 
+##### Queue consumer
+
+To receive from a queue use the `Queue` decorator. It takes the same options as `Subscription`, with `queueName` instead of `topic` and `subscription`:
+
+```typescript
+@Queue({
+    queueName: 'sample-queue',
+    receiveMode: 'receiveAndDelete', // or peekLock
+  })
+getJobs(@Payload() message: ServiceBusReceivedMessage) {
+  console.log(message);
+}
+```
+
+##### Settling messages yourself (peekLock)
+
+In `peekLock` mode a message is completed when the handler returns. To settle it yourself, turn that off with `options.autoCompleteMessages: false` and use the receiver from the context:
+
+```typescript
+@Subscription({
+    topic: 'sample-topic',
+    subscription: 'sample-subscription',
+    receiveMode: 'peekLock',
+    options: { autoCompleteMessages: false },
+  })
+async getMessages(
+  @Payload() message: ServiceBusReceivedMessage,
+  @Ctx() context: AzureServiceBusContext,
+) {
+  const receiver = context.getReceiver();
+  try {
+    await handle(message);
+    await receiver.completeMessage(message);
+  } catch {
+    await receiver.abandonMessage(message); // or deadLetterMessage / deferMessage
+  }
+}
+```
+
+`context.getMessage()` returns the same message the handler gets as payload.
+
+Note that an exception thrown by an event handler is caught by Nest's exception filter, so with automatic completion the message is still completed. Settle it yourself, as above, if a failure must make it be redelivered.
+
+##### Shutdown
+
+Closing the application (`app.close()`) stops receiving new messages, waits for the handlers that are running to finish (and for their messages to be completed), and then closes the receivers and the connection.
+
+## Tests
+
+`npm test` runs the unit tests, with no Azure connection.
+
+`npm run test:integration` runs a NestJS microservice with this transport against the [Azure Service Bus emulator](https://learn.microsoft.com/azure/service-bus-messaging/overview-emulator), and skips itself when the emulator is not reachable. `test/integration/docker-compose.yml` explains how to start it; doing so requires accepting Microsoft's license terms for the emulator and for SQL Server.
+
 ## Stay in touch
 
 * Author - [Niurmiguel](https://github.com/Niurmiguel)

@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (recommended).
 - Client option `replySessions`: each client receives its replies in a session
   of its own, for several clients (e.g. replicas) sending to the same entity.
+- Client option `closeTimeoutInMs`: how long `close()` waits for the sends in
+  flight before it cancels them (5 seconds by default; see "Behavior changes").
 - Server option `allowedReplyTo` (a list of entity names or a function): a
   request whose `replyTo` is not allowed gets no reply, its handler does not
   run, and in `peekLock` mode it is dead-lettered (`ReplyToNotAllowed`). Not
@@ -139,14 +141,16 @@ These compile differently against 1.1.0 code:
   unhandled rejection, and after `close()` a send kept the process alive for
   about 90 seconds and then crashed it. Send errors now fail the Observable,
   senders and receivers are closed in order, and `close()` waits for the sends
-  in flight.
+  in flight (for up to `closeTimeoutInMs`).
 - Client: a `send()` whose reply queue does not exist, or cannot be received
   from (e.g. it has sessions and `replySessions` is off), waited forever while
   the SDK retried; it now fails. Reply receiver errors are logged (they were
   thrown inside a promise nobody awaited).
 - Client: send options went through `JSON.stringify`/`JSON.parse`: an
   `abortSignal` arrived as `{}` and an option set to `undefined` broke the
-  send. They are now passed as given.
+  send. They are now passed as given, except that the SDK gets an
+  `abortSignal` of the send's own, which the caller's `abortSignal` aborts (so
+  that `close()` can cancel the send too).
 - Client: an `emit()` with no subscriber lost its error; it is now logged.
 - Typings: the `.d.ts` files imported `@azure/core-amqp`, which is not a
   dependency; with pnpm (or any non-hoisted layout) and `skipLibCheck: false`
@@ -231,10 +235,23 @@ Read these before upgrading a service that relies on the 1.1.0 behavior.
   wrong caller). With several clients on one reply queue, replies can bounce and
   end in the dead-letter queue: use `replySessions`. A reply whose
   `correlationId` is not a request id is dead-lettered at once.
-- **`close()` of the client** waits for the sends in flight, and fails the
-  `send()` calls still waiting for a reply with an error. After `close()`, a new
-  `send()`/`emit()` connects again. A connection that fails to close is logged
-  and `close()` still resolves (1.1.0 rejected).
+- **`close()` of the client** waits for the sends in flight (1.1.0 did not, see
+  "Fixed") for up to `closeTimeoutInMs`, 5 seconds by default, and then
+  cancels them with the `abortSignal` of `sendMessages()`: their `emit()` and
+  `send()` Observables fail with an error that starts with `close() cancelled
+  the send to "<entity>"` (its `cause` is the SDK's error), a warning is
+  logged, and the message may or may not have reached Service Bus. `0`
+  cancels at once; `Infinity` waits for as long as the sends take, which for a
+  send that gets no answer means the SDK's timeouts and retries (more than
+  five minutes against the emulator). With nothing in flight `close()` does
+  not wait. The reply receivers get the same limit (at least one second) to
+  close: the SDK cannot cancel a link it is still attaching, a send's or a
+  receiver's, so `close()` goes on without it after that and warns, and closes
+  the connection once the SDK gives the attach up (up to a minute; the process
+  stays alive until then). Then `close()` fails the `send()` calls still
+  waiting for a reply with an error. After `close()`, a new `send()`/`emit()`
+  connects again. A connection that fails to close is logged and `close()`
+  still resolves (1.1.0 rejected).
 - **The SDK's reconnect retries** are cancelled (with the `abortSignal` of
   `subscribe()`) once the receivers are closed, not before: with
   `@azure/service-bus` 7.9.x, cancelling them while a link was being attached
@@ -244,7 +261,9 @@ Read these before upgrading a service that relies on the 1.1.0 behavior.
   reply session cancels that call, so prefer 7.10.0 or later with
   `replySessions`. The same goes, on the server, for a reply that `close()`
   cancels while its link is still being attached (only after
-  `closeTimeoutInMs` and one more second).
+  `closeTimeoutInMs` and one more second), and on the client for a send that
+  `close()` cancels while its link is still being attached (only after the
+  client's `closeTimeoutInMs`).
 - **`replyTimeoutInMs`** out of range (negative, `NaN`, not a number, or more
   than 2147483647) throws a `RangeError` when the client is created. Before, a
   value above 2147483647 (or `Infinity`) made every `send()` time out at once,

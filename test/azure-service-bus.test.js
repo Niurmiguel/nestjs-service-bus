@@ -2050,6 +2050,117 @@ test("close() cancels an endless streamed response after closeTimeoutInMs", asyn
   assert.doesNotMatch(warning, /delivers them again/);
 });
 
+/**
+ * Replies for `listeningWithReplies()` that never finish until their abort
+ * signal fires, as a send over a slow link that `close()` would otherwise
+ * close the connection under (the SDK then keeps that send's timers, up to
+ * 60 s, and with them the process, alive). The first `okFirst` replies go
+ * out at once. `at.close` snapshots them when the connection is closed.
+ */
+function hangingReplies(okFirst) {
+  const sends = [];
+  const at = {};
+  const sendMessages = (messages, options) => {
+    const send = { messages, signal: options?.abortSignal, settled: false };
+    sends.push(send);
+    if (sends.length <= okFirst) {
+      send.settled = true;
+      return Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+      send.signal?.addEventListener("abort", () => {
+        send.settled = true;
+        reject(Object.assign(new Error("The operation was aborted."), { name: "AbortError" }));
+      });
+    });
+  };
+  const watchClose = (fake) => {
+    const closeConnection = fake.client.close;
+    fake.client.close = async () => {
+      at.close = { started: sends.length, unsettled: sends.filter((s) => !s.settled).length };
+      return closeConnection();
+    };
+  };
+  return { sends, at, sendMessages, watchClose };
+}
+
+const closedWithin = (server, ms) =>
+  Promise.race([
+    server.close().then(() => "closed"),
+    new Promise((resolve) => setTimeout(resolve, ms, "still waiting").unref()),
+  ]);
+
+test("close() cancels a reply of a cut response still being sent before it closes the connection", async () => {
+  const endless = endlessResponse();
+  const replies = hangingReplies(1);
+  const { server, receiver, fake, logged } = await listeningWithReplies(
+    async () => endless.observable,
+    { closeTimeoutInMs: 100 },
+    replies.sendMessages
+  );
+  replies.watchClose(fake);
+  const request = requestFrom120();
+  await receiver.handlers.processMessage(request); // the first reply went out
+  assert.deepEqual(receiver.completed, [request]);
+
+  assert.equal(await closedWithin(server, 5_000), "closed");
+  assert.deepEqual(replies.at.close, { started: 2, unsettled: 0 }, "the connection was closed under a reply");
+  assert.equal(replies.sends[1].signal?.aborted, true, "the reply being sent was not cancelled");
+  // Cancelled by close(), which already warned: no error, no error reply.
+  assert.deepEqual(logged.filter((e) => e.level === "error"), []);
+  assert.equal(replies.sends.length, 2);
+});
+
+test("close() cancels a first reply still being sent, and leaves its request unsettled", async () => {
+  const { NEVER, startWith } = require("rxjs");
+  const replies = hangingReplies(0);
+  const { server, receiver, fake, logged } = await listeningWithReplies(
+    async () => NEVER.pipe(startWith("first")),
+    { closeTimeoutInMs: 100 },
+    replies.sendMessages
+  );
+  replies.watchClose(fake);
+  const processing = receiver.handlers.processMessage(requestFrom120());
+  await ticks();
+
+  assert.equal(await closedWithin(server, 5_000), "closed");
+  await processing;
+  assert.deepEqual(replies.at.close, { started: 1, unsettled: 0 }, "the connection was closed under a reply");
+  assert.equal(replies.sends[0].signal?.aborted, true);
+  // The client did not get it: the request comes back once its lock expires.
+  assert.deepEqual(receiver.completed, []);
+  assert.deepEqual(receiver.abandoned, []);
+  assert.deepEqual(logged.filter((e) => e.level === "error"), []);
+  assert.equal(replies.sends.length, 1, "an error reply was sent after the cancelled one");
+});
+
+test("close() does not send the replies a cut response had queued", async () => {
+  const endless = endlessResponse(2);
+  const sends = [];
+  let connectionClosed = false;
+  const { server, receiver, fake, logged } = await listeningWithReplies(
+    async () => endless.observable,
+    { closeTimeoutInMs: 100 },
+    // Slower than the response: replies queue up behind each other.
+    async (messages) => {
+      sends.push({ afterClose: connectionClosed });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    }
+  );
+  const closeConnection = fake.client.close;
+  fake.client.close = async () => {
+    connectionClosed = true;
+    return closeConnection();
+  };
+  await receiver.handlers.processMessage(requestFrom120());
+  assert.equal(await closedWithin(server, 5_000), "closed");
+  const sent = sends.length;
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(sends.length, sent, "replies were still being sent after close()");
+  assert.deepEqual(sends.filter((s) => s.afterClose), []);
+  assert.deepEqual(logged.filter((e) => e.level === "error"), []);
+});
+
 test("close() cancels a response that has not replied yet, and leaves its message unsettled", async () => {
   const { NEVER, finalize } = require("rxjs");
   let tornDown = false;

@@ -93,6 +93,15 @@ const DEFAULT_CLOSE_TIMEOUT_MS = 25_000;
  */
 const STOP_RECEIVING_WAIT_MS = 1_000;
 
+/**
+ * How long `close()` lets the replies still being sent of the responses it
+ * cut finish, before it cancels them (and then, how long it waits for the
+ * cancellation). They are not left running: closing the connection under a
+ * send leaves the SDK's timers of that send (up to 60 s) running, and they
+ * keep the process alive.
+ */
+const REPLY_CANCEL_WAIT_MS = 1_000;
+
 /** Dead-letter reason of a request whose `replyTo` is not allowed. */
 const REPLY_TO_NOT_ALLOWED = "ReplyToNotAllowed";
 
@@ -155,6 +164,11 @@ class FollowedObservable {
     }
   }
 
+  /** Whether it was stopped: its replies not sent yet are dropped. */
+  get isStopped(): boolean {
+    return this.stopped;
+  }
+
   stop(byClose = false): void {
     if (this.stopped) {
       return;
@@ -204,6 +218,10 @@ export class AzureServiceBusServer
    * would cancel it).
    */
   private generation = 0;
+  /** Replies being sent right now: `close()` does not close the connection under them. */
+  private readonly sending = new Set<Promise<void>>();
+  /** Cancels the replies `close()` gave up on (see `settleReplies()`). */
+  private replyAbort = new AbortController();
   /** `allowedReplyTo`'s verdict per request, so it is asked once. */
   private readonly replyToRejected = new WeakMap<ServiceBusReceivedMessage, boolean>();
   private closing: Promise<void> | undefined;
@@ -560,11 +578,19 @@ export class AzureServiceBusServer
         ...(sessionId && { sessionId }),
         ...(this.replyTimeToLiveInMs !== undefined && { timeToLive: this.replyTimeToLiveInMs }),
       };
-      try {
-        await sender.sendMessages([responseMessage]);
-      } finally {
-        await sender.close();
-      }
+      const sending = (async () => {
+        try {
+          await sender.sendMessages([responseMessage], { abortSignal: this.replyAbort.signal });
+        } finally {
+          await sender.close();
+        }
+      })();
+      this.sending.add(sending);
+      const forget = () => {
+        this.sending.delete(sending);
+      };
+      sending.then(forget, forget);
+      return sending;
     };
   }
 
@@ -621,7 +647,12 @@ export class AzureServiceBusServer
     //    for up to closeTimeoutInMs; then their Observables are unsubscribed.
     await this.waitForInFlight();
 
-    // 3. Close the links, and only then cancel the SDK's reconnect retries.
+    // 3. The replies still being sent of the responses close() cut, if any,
+    //    get up to REPLY_CANCEL_WAIT_MS (while the receivers close) and are
+    //    cancelled after that: the connection is not closed under them.
+    const replies = this.settleReplies();
+
+    // 4. Close the links, and only then cancel the SDK's reconnect retries.
     //    In that order on purpose: aborting while the SDK is attaching a link
     //    made @azure/service-bus 7.9.x close that link without handling its
     //    error, an unhandled rejection that ends the process when the entity
@@ -638,17 +669,47 @@ export class AzureServiceBusServer
     }
     await Promise.all(stopping);
     this.receivers.clear();
+    await replies;
 
-    // 4. The connection. A failure is logged, not thrown: Nest stops its own
+    // 5. The connection. A failure is logged, not thrown: Nest stops its own
     //    shutdown (the other servers, the onApplicationShutdown hooks) at the
     //    first close() that rejects, and there is nothing left to retry here.
     const client = this.sbClient;
     this.sbClient = undefined;
     const closeErr = client ? await settled(client.close()) : undefined;
+    if (this.replyAbort.signal.aborted) {
+      this.replyAbort = new AbortController(); // for a later listen()
+    }
     if (closeErr !== undefined) {
       this.logger.error(
         `Could not close the Azure Service Bus connection: ${describeError(closeErr)}`,
         closeErr instanceof Error ? closeErr.stack : undefined
+      );
+    }
+  }
+
+  /**
+   * Waits for the replies being sent (only those of responses that
+   * `waitForInFlight()` gave up on can be left) for up to
+   * `REPLY_CANCEL_WAIT_MS`, then cancels them and waits as long again for
+   * the SDK to give them up.
+   */
+  private async settleReplies(): Promise<void> {
+    const all = () => Promise.all([...this.sending].map(settled));
+    if (this.sending.size === 0) {
+      return;
+    }
+    await this.waitUpTo(REPLY_CANCEL_WAIT_MS, all());
+    if (this.sending.size === 0) {
+      return;
+    }
+    const cancelled = this.sending.size;
+    this.replyAbort.abort();
+    await this.waitUpTo(REPLY_CANCEL_WAIT_MS, all());
+    if (this.sending.size > 0) {
+      this.logger.warn(
+        `close() cancelled ${cancelled} reply(ies) still being sent; ${this.sending.size} did ` +
+          "not stop, and the SDK may keep the process alive until they time out."
       );
     }
   }
@@ -821,19 +882,26 @@ export class AzureServiceBusServer
     let failed = false;
     let firstSent: () => void;
     const first = new Promise<void>((resolve) => (firstSent = resolve));
+    // Once close() cut the response, its replies not sent yet are dropped,
+    // and one it cancels while being sent did not reach the client.
+    let cancelled = false;
     const respond = (packet: WritePacket) => {
       publishing = publishing.then(async () => {
-        if (failed) return;
+        if (failed || stream.isStopped) return;
         try {
           await publish(packet);
         } catch (err) {
           failed = true;
+          if (stream.cancelledByClose) {
+            cancelled = true; // close() already warned about it
+            return;
+          }
           stream.stop();
           await this.replyFailed(err, replyTo, singleReply ? undefined : publish);
         }
       });
       publishing.then(() => {
-        stream.replied = true;
+        if (!cancelled) stream.replied = true;
         firstSent();
       });
     };

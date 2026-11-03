@@ -1,0 +1,54 @@
+# Azure Service Bus emulator for the optional integration tests
+# (`npm run test:integration`). Based on Microsoft's documented setup:
+# https://learn.microsoft.com/azure/service-bus-messaging/test-locally-with-service-bus-emulator
+#
+# LICENSES: this file does not accept anything on your behalf. Both containers
+# start only if you set ACCEPT_EULA=Y yourself, and by doing so YOU accept the
+# Microsoft license terms of:
+#   - the Service Bus emulator:
+#     https://github.com/Azure/azure-service-bus-emulator-installer/blob/main/EMULATOR_EULA.txt
+#   - SQL Server for Linux (the emulator's storage):
+#     https://go.microsoft.com/fwlink/?LinkId=746388
+#
+# Usage (from the repository root):
+#   export ACCEPT_EULA=Y                      # only if you accept the terms above
+#   export MSSQL_SA_PASSWORD='<8+ chars, 3 of: upper, lower, digit, symbol>'
+#   docker compose -f test/integration/docker-compose.yml up -d --wait
+#   npm run test:integration
+#   docker compose -f test/integration/docker-compose.yml down -v
+#
+# SQL Server is published for amd64 only. On arm64 hosts (Apple silicon) it
+# runs under Docker's amd64 emulation, which is Microsoft's documented way to
+# run SQL Server containers on macOS for development. The emulator image is
+# multi-arch and runs natively.
+name: nestjs-service-bus-itest
+services:
+  emulator:
+    # Emulator 2.0.1, pinned by digest (multi-arch index: amd64 and arm64).
+    # The tag is informative: Docker pulls the digest.
+    image: mcr.microsoft.com/azure-messaging/servicebus-emulator:2.0.1@sha256:5a96d893b245031740f7d46e0fe5ff282d24b78c4b7d761dd57590f3f010a9b3
+    volumes:
+      - "./emulator/Config.json:/ServiceBus_Emulator/ConfigFiles/Config.json:ro"
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:5300:5300"
+    environment:
+      SQL_SERVER: mssql
+      MSSQL_SA_PASSWORD: "${MSSQL_SA_PASSWORD:?set MSSQL_SA_PASSWORD}"
+      ACCEPT_EULA: "${ACCEPT_EULA:?set ACCEPT_EULA=Y to accept the Microsoft license terms listed above}"
+      EMULATOR_HTTP_PORT: "5300"
+      SQL_WAIT_INTERVAL: "${SQL_WAIT_INTERVAL:-15}"
+    depends_on:
+      - mssql
+    healthcheck:
+      # The image is distroless (no shell, no curl), so the health endpoint is
+      # polled from the host by the test helper instead. See helpers.js.
+      disable: true
+  mssql:
+    # SQL Server 2022 16.0.4305.5 (what 2022-latest pointed to on 2026-11-02),
+    # pinned by digest (amd64 only). The tag is informative.
+    image: mcr.microsoft.com/mssql/server:2022-latest@sha256:cf8f0ab2ebe61feec2eed2629061a07d247f791c2a8ddda74a4ac9f06a291718
+    platform: linux/amd64
+    environment:
+      ACCEPT_EULA: "${ACCEPT_EULA:?set ACCEPT_EULA=Y to accept the Microsoft license terms listed above}"
+      MSSQL_SA_PASSWORD: "${MSSQL_SA_PASSWORD:?set MSSQL_SA_PASSWORD}"

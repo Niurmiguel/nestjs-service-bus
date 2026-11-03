@@ -1,25 +1,93 @@
 name: Publish Package to npmjs
+
 on:
   release:
-    types: [created]
+    # Not "created": that also fires when a draft release is saved.
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
 jobs:
+  # Builds, tests and packs with no token at all: neither the npm token nor
+  # the OIDC token (id-token) is available to the code that runs here.
   build:
+    name: Build, test and pack
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4.1.4
-      # Setup .npmrc file to publish to npm
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: "20.x"
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.x"
+          # No dependency cache: in a release workflow a poisoned cache would
+          # end up in the package.
+      # No dependency needs an install script.
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - run: npm run check:pack
+      - name: Pack
+        run: |
+          mkdir pack
+          npm run build
+          npm pack --ignore-scripts --pack-destination pack
+          sha256sum pack/*.tgz
+      - name: Upload the tarball
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: npm-package
+          path: pack/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  # Publishes the tarball the build job tested. It runs no code from the
+  # repository or its dependencies: no checkout, no install.
+  publish:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # npm trusted publishing (OIDC) and provenance: no npm token is stored.
+      id-token: write
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.x"
           registry-url: "https://registry.npmjs.org"
-      - run: |
-          if [ -e yarn.lock ]; then
-          yarn install --frozen-lockfile
-          elif [ -e package-lock.json ]; then
-          npm ci
-          else
-          npm i
+      - name: Download the tarball
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: npm-package
+          path: pack
+      - name: Publish the tested tarball
+        run: |
+          # The ./ matters: npm reads "pack/x.tgz" as a GitHub repository.
+          set -- ./pack/*.tgz
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "Expected exactly one tarball in pack/, found: $*" >&2
+            exit 1
           fi
-      - run: npm publish
+          sha256sum "$1"
+          # A pre-release goes to the "next" dist-tag, so that `npm install`
+          # keeps resolving to the last stable version.
+          tag=latest
+          if [ "$PRERELEASE" = "true" ]; then
+            tag=next
+          fi
+          # Staged publishing: the version only goes live when a maintainer approves it
+          # on npmjs.com with 2FA. The trusted publisher allows only `npm stage publish`.
+          npm_version="$(npm --version)"
+          if ! node -e 'const [a, b] = process.argv[1].split(".").map(Number); process.exit(a > 11 || (a === 11 && b >= 15) ? 0 : 1)' "$npm_version"; then
+            echo "npm $npm_version cannot stage packages: npm 11.15.0 or later is required" >&2
+            exit 1
+          fi
+          npm stage publish "$1" --provenance --access public --ignore-scripts --tag "$tag"
+          echo "Staged \`$(basename "$1")\` with dist-tag \`$tag\`. Approve it on npmjs.com (package, Staged Packages) with 2FA to publish it." >> "$GITHUB_STEP_SUMMARY"
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PRERELEASE: ${{ github.event.release.prerelease }}

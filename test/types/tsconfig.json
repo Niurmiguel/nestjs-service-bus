@@ -1,0 +1,17 @@
+{
+  // Compile-time tests of the published typings (dist/*.d.ts), as a strict
+  // consumer would compile them: `npm test` runs `tsc -p test/types`.
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "strict": true,
+    "skipLibCheck": false,
+    "esModuleInterop": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+    "noEmit": true,
+    "types": ["node"]
+  },
+  "files": ["public-api.ts"]
+}

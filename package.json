@@ -1,13 +1,20 @@
 {
   "name": "@niur/nestjs-service-bus",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "NestJS Azure Service Bus Microservice Transport",
   "main": "dist/index",
   "types": "dist/index",
+  "files": [
+    "dist",
+    "lib",
+    "CHANGELOG.md"
+  ],
   "scripts": {
-    "build": "rimraf dist && tsc",
-    "prepublish": "npm run build",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
+    "prepack": "npm run build",
+    "test": "npm run build && tsc -p test/types && node --test --test-timeout=10000 test/azure-service-bus.test.js",
+    "test:integration": "npm run build && node --test --test-force-exit --test-timeout=60000 test/integration/azure-service-bus.integration.test.mjs",
+    "check:pack": "npm run build && node scripts/check-pack.mjs"
   },
   "repository": {
     "type": "git",
@@ -20,22 +27,22 @@
   },
   "homepage": "https://github.com/Niurmiguel/nestjs-service-bus#readme",
   "peerDependencies": {
-    "@nestjs/common": "^10.0.4",
-    "@nestjs/core": "^10.0.4",
-    "@nestjs/microservices": "^10.0.4",
-    "reflect-metadata": "^0.1.13",
+    "@azure/service-bus": "^7.9.0",
+    "@nestjs/common": "^10.0.4 || ^11.0.0",
+    "@nestjs/core": "^10.0.4 || ^11.0.0",
+    "@nestjs/microservices": "^10.0.4 || ^11.0.0",
+    "reflect-metadata": "^0.1.13 || ^0.2.0",
     "rxjs": "^7.8.1"
   },
   "devDependencies": {
-    "@azure/service-bus": "^7.9.4",
-    "@nestjs/common": "^10.3.7",
-    "@nestjs/core": "^10.3.7",
-    "@nestjs/microservices": "^10.3.7",
-    "@types/node": "^20.0.0",
+    "@azure/service-bus": "^7.10.0",
+    "@nestjs/common": "^11.2.8",
+    "@nestjs/core": "^11.2.8",
+    "@nestjs/microservices": "^11.2.8",
+    "@types/node": "^22.20.5",
     "reflect-metadata": "^0.2.2",
-    "rimraf": "^5.0.5",
-    "rxjs": "^7.8.1",
-    "typescript": "^5.4.5"
+    "rxjs": "^7.8.2",
+    "typescript": "^5.9.3"
   },
   "keywords": [
     "azure",

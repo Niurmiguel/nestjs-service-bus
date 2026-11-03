@@ -1,10 +1,9 @@
 import { SubscribeOptions } from "@azure/service-bus";
 
-export interface SbSubscriberMetadataOptions {
-  /**
-   * Name of the subscription (under the `topic`) that we want to receive from.
-   */
-  subscription: string;
+/**
+ * Receiver options shared by queues and topic subscriptions.
+ */
+export interface SbReceiverMetadataOptions {
   /**
    * Represents the receive mode for the receiver.
    *
@@ -51,6 +50,13 @@ export interface SbSubscriberMetadataOptions {
   options?: SubscribeOptions;
 }
 
+export interface SbSubscriberMetadataOptions extends SbReceiverMetadataOptions {
+  /**
+   * Name of the subscription (under the `topic`) that we want to receive from.
+   */
+  subscription: string;
+}
+
 export interface SbSubscriptionMetadataOptions
   extends SbSubscriberMetadataOptions {
   /**
@@ -59,6 +65,14 @@ export interface SbSubscriptionMetadataOptions
   topic: string;
 }
 
+export interface SbQueueMetadataOptions extends SbReceiverMetadataOptions {
+  /**
+   * Name of the queue we want to receive from.
+   */
+  queueName: string;
+}
+
 export interface SbSubscriberTypeMap {
   subscription: SbSubscriptionMetadataOptions;
+  queue: SbQueueMetadataOptions;
 }

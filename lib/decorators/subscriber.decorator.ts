@@ -4,6 +4,8 @@ import { SB_SUBSCRIBER_METADATA } from "../azure-service-bus.constants";
 import { SbSubscriberMetadata } from "../metadata";
 import {
   MetaOrMetaFactory,
+  SbQueueMetadataOptions,
+  SbSubscriberTypeMap,
   SbSubscriptionMetadataOptions,
 } from "../interfaces";
 
@@ -24,18 +26,16 @@ function storeMetadata(
   }
 }
 
-export function Subscription(
-  metadata: MetaOrMetaFactory<SbSubscriptionMetadataOptions>
+function subscriber<T extends keyof SbSubscriberTypeMap>(
+  type: T,
+  metadata: MetaOrMetaFactory<SbSubscriberTypeMap[T]>
 ) {
   return (
     target: object,
     key: string | symbol,
     descriptor?: PropertyDescriptor
   ) => {
-    const sbSubscriberMetadata = new SbSubscriberMetadata(
-      "subscription",
-      metadata
-    );
+    const sbSubscriberMetadata = new SbSubscriberMetadata(type, metadata);
 
     storeMetadata(target, key, sbSubscriberMetadata);
 
@@ -43,4 +43,20 @@ export function Subscription(
       return EventPattern(sbSubscriberMetadata)(target, key, descriptor);
     }
   };
+}
+
+/**
+ * Receives the messages of a topic subscription.
+ */
+export function Subscription(
+  metadata: MetaOrMetaFactory<SbSubscriptionMetadataOptions>
+) {
+  return subscriber("subscription", metadata);
+}
+
+/**
+ * Receives the messages of a queue.
+ */
+export function Queue(metadata: MetaOrMetaFactory<SbQueueMetadataOptions>) {
+  return subscriber("queue", metadata);
 }

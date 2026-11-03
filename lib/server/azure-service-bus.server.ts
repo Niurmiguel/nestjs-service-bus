@@ -46,6 +46,7 @@ import {
   readDurationOption,
   readTimerOption,
   redactOptions,
+  waitUpTo,
 } from "../utils";
 
 export { AZURE_SERVICE_BUS_TRANSPORT };
@@ -641,7 +642,7 @@ export class AzureServiceBusServer
     // 1. No new messages. The links stay open, so the messages being handled
     //    can still be settled.
     const stopping = active.map(({ subscription }) => settled(subscription.close()));
-    await this.waitUpTo(STOP_RECEIVING_WAIT_MS, Promise.all(stopping));
+    await waitUpTo(STOP_RECEIVING_WAIT_MS, Promise.all(stopping));
 
     // 2. Let the handlers in flight finish (a drain can still deliver one),
     //    for up to closeTimeoutInMs; then their Observables are unsubscribed.
@@ -699,31 +700,18 @@ export class AzureServiceBusServer
     if (this.sending.size === 0) {
       return;
     }
-    await this.waitUpTo(REPLY_CANCEL_WAIT_MS, all());
+    await waitUpTo(REPLY_CANCEL_WAIT_MS, all());
     if (this.sending.size === 0) {
       return;
     }
     const cancelled = this.sending.size;
     this.replyAbort.abort();
-    await this.waitUpTo(REPLY_CANCEL_WAIT_MS, all());
+    await waitUpTo(REPLY_CANCEL_WAIT_MS, all());
     if (this.sending.size > 0) {
       this.logger.warn(
         `close() cancelled ${cancelled} reply(ies) still being sent; ${this.sending.size} did ` +
           "not stop, and the SDK may keep the process alive until they time out."
       );
-    }
-  }
-
-  /** Waits for `work` to settle, for at most `ms`. */
-  private async waitUpTo(ms: number, work: Promise<unknown>): Promise<void> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const timedOut = new Promise<void>((resolve) => {
-      timer = setTimeout(resolve, ms);
-    });
-    try {
-      await Promise.race([work, timedOut]);
-    } finally {
-      clearTimeout(timer);
     }
   }
 

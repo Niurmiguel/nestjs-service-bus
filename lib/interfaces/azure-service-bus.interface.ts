@@ -88,6 +88,30 @@ export interface AzureServiceBusClientOptions extends AzureServiceBusOptions {
    */
   replyTimeoutInMs?: number;
   /**
+   * How long `close()` waits for the `send()`/`emit()` calls whose message is
+   * still being sent. When it runs out, those sends are cancelled (with the
+   * `abortSignal` of the SDK's `sendMessages()`), their Observables fail with
+   * an error that says so, a warning is logged, and the connection is closed:
+   * a cancelled message may or may not have reached Service Bus. The SDK gets
+   * up to one more second to give the sends up.
+   *
+   * The reply receivers of `send()` get the same time limit (and at least one
+   * second) to close. The SDK cannot cancel a link it is still attaching (a
+   * send's or a receiver's): `close()` goes on without it and warns, and the
+   * connection is closed once the SDK gives the attach up (up to a minute),
+   * so the process stays alive until then.
+   *
+   * From 0 to 2147483647 (2^31 - 1), or `Infinity` to wait for as long as the
+   * sends take (the SDK's own timeouts and retries apply: minutes for a send
+   * that gets no answer); another value throws a `RangeError` when the
+   * client is created. `0` cancels them at once.
+   *
+   * - **Default**: `5000` (5 seconds). A send usually takes milliseconds; the
+   *   default leaves room for a slow network while keeping the shutdown
+   *   short, next to the server's own `closeTimeoutInMs`.
+   */
+  closeTimeoutInMs?: number;
+  /**
    * Receive the replies of `send()` in a session of their own (one per client
    * instance), so that several clients (e.g. several replicas of a service)
    * can send to the same entity and each gets only its replies.

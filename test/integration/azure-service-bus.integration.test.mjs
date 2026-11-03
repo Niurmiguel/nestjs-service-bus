@@ -1059,5 +1059,33 @@ describe(
       assert.equal(code, 0, `child did not exit cleanly:\n${output()}`);
       assert.match(output(), /received/);
     });
+
+    test("client close() cancels the sends still in flight: the process exits on its own", async () => {
+      // The child delays each AMQP transfer by 30 s, and its client has a
+      // closeTimeoutInMs of 1 s: close() must cancel its emit() and send().
+      const { code, output } = await runChild("./client-close.js", 20_000, ["30000", "1000"]);
+      assert.equal(code, 0, `child did not exit on its own:\n${output()}`);
+      const closedIn = Number(/^close=(\d+)$/m.exec(output())?.[1]);
+      assert.ok(closedIn >= 900 && closedIn < 3_000, `close() took ${closedIn} ms:\n${output()}`);
+      for (const call of ["emit", "send"]) {
+        assert.match(
+          output(),
+          new RegExp(`^${call}=error: close\\(\\) cancelled the send to "itest\\.junk"`, "m"),
+          output()
+        );
+      }
+      assert.match(output(), /^warn: close\(\) cancelled 2 send\(s\) still in flight/m, output());
+    });
+
+    test("client close() lets the sends that finish in time go out, and does not wait otherwise", async () => {
+      const { code, output } = await runChild("./client-close.js", 20_000, ["0", "5000"]);
+      assert.equal(code, 0, `child did not exit on its own:\n${output()}`);
+      const closedIn = Number(/^close=(\d+)$/m.exec(output())?.[1]);
+      assert.ok(closedIn < 1_000, `close() took ${closedIn} ms:\n${output()}`);
+      assert.match(output(), /^emit=ok$/m, output());
+      // Nobody answers itest.junk: the request was sent, its reply never comes.
+      assert.match(output(), /^send=error: The client was closed before the reply arrived$/m, output());
+      assert.doesNotMatch(output(), /^(warn|error): /m, output());
+    });
   }
 );

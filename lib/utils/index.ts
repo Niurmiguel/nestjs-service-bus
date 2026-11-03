@@ -130,3 +130,26 @@ export class RateLimitedWarning {
     );
   }
 }
+
+/**
+ * Waits for `work` to settle, for at most `ms` (at most `MAX_TIMER_MS`; with
+ * `Infinity`, for as long as it takes). Never rejects.
+ */
+export async function waitUpTo(ms: number, work: Promise<unknown>): Promise<void> {
+  const quiet = work.then(
+    () => undefined,
+    () => undefined
+  );
+  if (ms === Infinity) {
+    return quiet;
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<void>((resolve) => {
+    timer = setTimeout(resolve, Math.min(Math.max(ms, 0), MAX_TIMER_MS));
+  });
+  try {
+    await Promise.race([quiet, timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
+}

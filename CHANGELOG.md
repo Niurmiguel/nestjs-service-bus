@@ -156,10 +156,11 @@ These compile differently against 1.1.0 code:
   not the client's is logged at most once a minute.
 - The package no longer publishes its CI workflows and configuration files
   (`.github/`, `.nvmrc`, `tsconfig.json`).
-- Releases are published from CI with npm provenance (`--provenance`): one job
-  builds and tests the package with dependency install scripts disabled, and a
-  separate job, the only one with the npm token and the OIDC token, publishes
-  that tarball. GitHub Actions are pinned to commit SHAs, with read-only
+- Releases are staged on npm from CI with npm trusted publishing (OIDC, no
+  stored npm token) and provenance: one job builds and tests the package with
+  dependency install scripts disabled, and a separate job, the only one with
+  the OIDC token, stages that tarball. A staged version is only published once
+  a maintainer approves it on npmjs.com with 2FA. GitHub Actions are pinned to commit SHAs, with read-only
   default permissions and no persisted checkout credentials.
 - An error that reaches the transport without going through Nest's exception
   filter is logged on the server and replied as Nest's generic

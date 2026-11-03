@@ -5,8 +5,22 @@ updates:
     schedule:
       interval: monthly
     open-pull-requests-limit: 10
+    # The @nestjs packages only install together: update them in one pull request.
+    groups:
+      nestjs:
+        patterns:
+          - "@nestjs/*"
     ignore:
       - dependency-name: "*eslint*"
+      # Major versions need code changes and a decision on the supported
+      # ranges: they are upgraded by hand.
+      - dependency-name: "@nestjs/*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      # @types/node stays on a Node.js line the package supports.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
     labels:
       - "dependencies"
   - package-ecosystem: "github-actions"

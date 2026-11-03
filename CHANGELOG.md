@@ -201,6 +201,11 @@ Read these before upgrading a service that relies on the 1.1.0 behavior.
   again once their lock expires, while a streamed response whose request was
   already completed just ends (its client gets no further replies). Set
   `closeTimeoutInMs: Infinity` to wait for as long as the handlers take.
+  A receiver that is still trying to connect (e.g. its entity does not exist)
+  adds up to one second. A receiver or the connection that fails to close is
+  logged and `close()` still resolves: 1.1.0 rejected when the connection
+  failed to close, and Nest then skipped the rest of its shutdown (the other
+  servers, the `onApplicationShutdown` hooks).
 - **Replies that are not the client's**: a client that receives a reply to a
   request it did not send abandons it (1.1.0 consumed it, and handed it to the
   wrong caller). With several clients on one reply queue, replies can bounce and
@@ -208,7 +213,16 @@ Read these before upgrading a service that relies on the 1.1.0 behavior.
   `correlationId` is not a request id is dead-lettered at once.
 - **`close()` of the client** waits for the sends in flight, and fails the
   `send()` calls still waiting for a reply with an error. After `close()`, a new
-  `send()`/`emit()` connects again.
+  `send()`/`emit()` connects again. A connection that fails to close is logged
+  and `close()` still resolves (1.1.0 rejected).
+- **The SDK's reconnect retries** are cancelled (with the `abortSignal` of
+  `subscribe()`) once the receivers are closed, not before: with
+  `@azure/service-bus` 7.9.x, cancelling them while a link was being attached
+  to an entity that rejects it (one that does not exist, say) ended the process
+  with an unhandled rejection, a bug of the SDK fixed in 7.10.0. One case is
+  left: a `replySessions` client that closes while it is still accepting its
+  reply session cancels that call, so prefer 7.10.0 or later with
+  `replySessions`.
 - **`replyTimeoutInMs`** out of range (negative, `NaN`, not a number, or more
   than 2147483647) throws a `RangeError` when the client is created. Before, a
   value above 2147483647 (or `Infinity`) made every `send()` time out at once,

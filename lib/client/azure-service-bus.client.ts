@@ -22,7 +22,7 @@ import {
   AzureServiceBusClientOptions,
   AzureServiceBusSenderOptions,
 } from "../interfaces";
-import { quote, readTimerOption, redactOptions } from "../utils";
+import { describeError, quote, readTimerOption, redactOptions } from "../utils";
 
 /** What `sendMessages()` accepts. */
 type SendableMessages = Parameters<ServiceBusSender["sendMessages"]>[0];
@@ -200,7 +200,8 @@ export class AzureServiceBusClient extends AzureServiceBusClientProxy {
   /**
    * Waits for the sends in flight, fails the `send()` calls still waiting for
    * a reply, closes the reply receivers and then the connection. A later
-   * `send()`/`emit()` connects again.
+   * `send()`/`emit()` connects again. A failure to close is logged, not thrown
+   * (Nest would skip the rest of its shutdown).
    */
   async close(): Promise<void> {
     await this.settleInFlight();
@@ -208,7 +209,14 @@ export class AzureServiceBusClient extends AzureServiceBusClientProxy {
     await this.settleInFlight();
     const client = this.sbClient;
     this.sbClient = undefined;
-    await client?.close();
+    try {
+      await client?.close();
+    } catch (err) {
+      this.logger.error(
+        `Could not close the Azure Service Bus connection: ${describeError(err)}`,
+        err instanceof Error ? err.stack : undefined
+      );
+    }
   }
 
   /**

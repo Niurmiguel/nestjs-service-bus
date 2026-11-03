@@ -28,6 +28,22 @@ export function quote(value: unknown): string {
 }
 
 /**
+ * A short description of an error, for the logs: its message, or the value as
+ * JSON when it is not an `Error` (the AMQP library under the SDK can reject
+ * with a plain AMQP error object, whose `String()` is "[object Object]").
+ */
+export function describeError(err: unknown): string {
+  if (err instanceof Error) {
+    return err.message;
+  }
+  try {
+    return JSON.stringify(err) ?? String(err);
+  } catch {
+    return String(err);
+  }
+}
+
+/**
  * Reads a duration option meant for a timer: `undefined` (not set), `Infinity`
  * (no limit) or a number of milliseconds from 0 to `MAX_TIMER_MS`. Anything
  * else is a configuration mistake, reported when the client or server is

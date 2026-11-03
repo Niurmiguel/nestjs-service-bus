@@ -38,6 +38,7 @@ import {
   SbSubscriptionMetadataOptions,
 } from "../interfaces";
 import {
+  describeError,
   quote,
   readDurationOption,
   readTimerOption,
@@ -78,6 +79,15 @@ interface ProcessingHooks {
  */
 const DEFAULT_CLOSE_TIMEOUT_MS = 25_000;
 
+/**
+ * How long `close()` waits for the subscriptions to stop before it waits for
+ * the handlers. Stopping drains the link's credits, which the SDK gives up on
+ * after 200 ms; what can take longer is a first subscribe() still retrying to
+ * connect (it ends when the retries are cancelled, at the end of close()), and
+ * such a receiver has no messages to drain.
+ */
+const STOP_RECEIVING_WAIT_MS = 1_000;
+
 /** Dead-letter reason of a request whose `replyTo` is not allowed. */
 const REPLY_TO_NOT_ALLOWED = "ReplyToNotAllowed";
 
@@ -103,18 +113,6 @@ function readAllowedReplyTo(
 
 /** What Nest's own exception filter sends for an unknown error. */
 const UNKNOWN_EXCEPTION = { status: "error", message: "Internal server error" };
-
-/** A short description of what a handler failed with, for the logs. */
-function describeError(err: unknown): string {
-  if (err instanceof Error) {
-    return err.message;
-  }
-  try {
-    return JSON.stringify(err);
-  } catch {
-    return String(err);
-  }
-}
 
 /**
  * Why a handler's Observable stopped being followed: `close()` gave up waiting
@@ -584,29 +582,58 @@ export class AzureServiceBusServer
     // receiver to be settled.
     const active = [...this.receivers.values()];
 
-    // 1. No new messages, and no more reconnect attempts. The links stay
-    //    open, so the messages being handled can still be settled.
-    for (const { abortController } of active) {
-      abortController.abort();
-    }
-    await Promise.all(active.map(({ subscription }) => settled(subscription.close())));
+    // 1. No new messages. The links stay open, so the messages being handled
+    //    can still be settled.
+    const stopping = active.map(({ subscription }) => settled(subscription.close()));
+    await this.waitUpTo(STOP_RECEIVING_WAIT_MS, Promise.all(stopping));
 
     // 2. Let the handlers in flight finish (a drain can still deliver one),
     //    for up to closeTimeoutInMs; then their Observables are unsubscribed.
     await this.waitForInFlight();
 
-    // 3. Close the links, then the connection.
+    // 3. Close the links, and only then cancel the SDK's reconnect retries.
+    //    In that order on purpose: aborting while the SDK is attaching a link
+    //    made @azure/service-bus 7.9.x close that link without handling its
+    //    error, an unhandled rejection that ends the process when the entity
+    //    rejects the link (e.g. it does not exist). receiver.close() waits for
+    //    an attach in progress, and afterwards the SDK starts no other.
     const failures = (
       await Promise.all(active.map(({ receiver }) => settled(receiver.close())))
     ).filter((err) => err !== undefined);
-    for (const err of failures) {
-      this.logger.error(`Could not close an Azure Service Bus receiver: ${err}`);
+    for (const { abortController } of active) {
+      abortController.abort();
     }
+    for (const err of failures) {
+      this.logger.error(`Could not close an Azure Service Bus receiver: ${describeError(err)}`);
+    }
+    await Promise.all(stopping);
     this.receivers.clear();
 
+    // 4. The connection. A failure is logged, not thrown: Nest stops its own
+    //    shutdown (the other servers, the onApplicationShutdown hooks) at the
+    //    first close() that rejects, and there is nothing left to retry here.
     const client = this.sbClient;
     this.sbClient = undefined;
-    await client?.close();
+    const closeErr = client ? await settled(client.close()) : undefined;
+    if (closeErr !== undefined) {
+      this.logger.error(
+        `Could not close the Azure Service Bus connection: ${describeError(closeErr)}`,
+        closeErr instanceof Error ? closeErr.stack : undefined
+      );
+    }
+  }
+
+  /** Waits for `work` to settle, for at most `ms`. */
+  private async waitUpTo(ms: number, work: Promise<unknown>): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, ms);
+    });
+    try {
+      await Promise.race([work, timedOut]);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**

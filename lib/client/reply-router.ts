@@ -9,7 +9,7 @@ import {
 import { LoggerService } from "@nestjs/common";
 import { inspect } from "util";
 
-import { quote, RateLimitedWarning } from "../utils";
+import { describeError, quote, RateLimitedWarning } from "../utils";
 
 /** A request waiting for its reply. */
 export interface ReplyWaiter {
@@ -56,7 +56,12 @@ const FINISHED_IDS_LIMIT = 1000;
 interface ReplyListener {
   readonly replyTo: string;
   readonly waiters: Map<string, ReplyWaiter>;
-  /** Aborted when the listener closes: stops the SDK's retries. */
+  /** Set when the listener starts closing: it no longer opens nor reports. */
+  closed: boolean;
+  /**
+   * Stops the SDK's retries. Aborted once the receiver is closed, or at once
+   * when the listener closes before it has a receiver (see `closeListener()`).
+   */
   readonly abortController: AbortController;
   receiver?: ServiceBusReceiver;
   subscription?: { close(): Promise<void> };
@@ -163,6 +168,7 @@ export class ReplyRouter {
     const listener: ReplyListener = {
       replyTo,
       waiters: new Map(),
+      closed: false,
       abortController: new AbortController(),
     };
     this.listeners.set(replyTo, listener);
@@ -172,7 +178,7 @@ export class ReplyRouter {
 
     listener.opened = (async () => {
       await previous;
-      if (signal.aborted) {
+      if (listener.closed) {
         return;
       }
       const client = this.getClient();
@@ -184,7 +190,7 @@ export class ReplyRouter {
           })
         : client.createReceiver(replyTo, { receiveMode: "peekLock" });
       listener.receiver = receiver;
-      if (signal.aborted) {
+      if (listener.closed) {
         return; // closeListener() closes it.
       }
       listener.subscription = receiver.subscribe(this.createHandlers(listener, receiver), {
@@ -194,7 +200,7 @@ export class ReplyRouter {
         abortSignal: signal,
       });
     })().catch((err) => {
-      if (signal.aborted) {
+      if (listener.closed) {
         return; // Closed while opening.
       }
       this.logger().error(
@@ -262,8 +268,8 @@ export class ReplyRouter {
       },
       processError: async ({ error, errorSource, entityPath }: ProcessErrorArgs) => {
         // It must resolve: the SDK awaits it. Errors while closing (abort,
-        // session released) are expected.
-        if (listener.abortController.signal.aborted) {
+        // session released, the link being closed) are expected.
+        if (listener.closed) {
           return;
         }
         const err = error as Error | undefined;
@@ -311,19 +317,33 @@ export class ReplyRouter {
     if (this.listeners.get(replyTo) === listener) {
       this.listeners.delete(replyTo);
     }
-    if (abortController.signal.aborted) {
+    if (listener.closed) {
       return; // Already closing.
     }
-    abortController.abort();
+    listener.closed = true;
+    if (!listener.receiver) {
+      // Still opening: cancel it (acceptSession() waits on the signal).
+      abortController.abort();
+    }
     const closing: Promise<void> = (async () => {
       await listener.opened;
+      // Close the receiver, and only then cancel the SDK's retries: aborting
+      // while the SDK is attaching a link made @azure/service-bus 7.9.x close
+      // that link without handling its error, an unhandled rejection that ends
+      // the process when the entity rejects the link (e.g. a reply queue that
+      // does not exist). receiver.close() waits for an attach in progress, and
+      // afterwards the SDK starts no other.
+      try {
+        await listener.receiver?.close();
+      } finally {
+        abortController.abort();
+      }
       await listener.subscription?.close();
-      await listener.receiver?.close();
     })()
       .catch((err) =>
         this.logger().error(
-          `Could not close the reply receiver on ${quote(replyTo)}: ${err?.message ?? err}`,
-          err?.stack
+          `Could not close the reply receiver on ${quote(replyTo)}: ${describeError(err)}`,
+          err instanceof Error ? err.stack : undefined
         )
       )
       .finally(() => {

@@ -393,6 +393,51 @@ test("client.send fails when its reply queue does not exist", async () => {
   await assert.rejects(reply, { code: "MessagingEntityNotFound" });
 });
 
+test("client cancels the SDK's retries on a failed reply queue only once no link is being attached", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  client.logger = silentLogger();
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+  const a = collect(client.send({ name: "orders" }, { body: 1 }));
+  await ticks();
+  const receiver = sdk.receivers[0];
+  const { finish, result, signal } = attachInProgress(receiver);
+
+  // The reply queue does not exist: the waiting send() fails and the reply
+  // receiver closes, while the SDK is attaching its link again.
+  await receiver.handlers.processError({
+    error: new ServiceBusError("The messaging entity could not be found", "MessagingEntityNotFound"),
+    errorSource: "receive",
+    entityPath: "orders.reply",
+  });
+  await a.done;
+  assert.equal(a.events[0][1].code, "MessagingEntityNotFound");
+  await ticks();
+  finish();
+  await client.close();
+  assert.equal(result.abortedWhenAttached, false, "the client aborted while the SDK attached a link");
+  assert.equal(signal.aborted, true, "the client did not cancel the SDK's retries");
+  assert.equal(receiver.closed, true);
+});
+
+test("client close() logs, and does not throw, a connection that fails to close", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  const logged = [];
+  client.logger = silentLogger(logged);
+  const sdk = fakeClientSdk();
+  sdk.close = async () => {
+    throw { condition: "amqp:internal-error", description: "boom" };
+  };
+  client.sbClient = sdk;
+
+  await client.close();
+  assert.match(
+    String(logged.find((e) => e.level === "error")?.args[0]),
+    /Could not close the Azure Service Bus connection: .*amqp:internal-error/
+  );
+  assert.throws(() => client.unwrap(), /Not initialized/);
+});
+
 test("client.send fails with ReplyTimeoutError after replyTimeoutInMs", async () => {
   const client = new AzureServiceBusClient({
     connectionString: CONNECTION_STRING,
@@ -1631,6 +1676,75 @@ test("server close() leaves no timer behind when the handlers finish in time", a
   await server.close();
   const after = process.getActiveResourcesInfo().filter((r) => r === "Timeout").length;
   assert.ok(after <= before, `${before} -> ${after}`);
+});
+
+// --- close() and the SDK's link attach ----------------------------------------
+
+/**
+ * Makes `receiver` behave like the SDK's while it attaches a link: close()
+ * waits for the attach to finish (it takes the link's lock), and the attach
+ * records whether the abort signal had fired by the time it finished, which
+ * is when @azure/service-bus 7.9.x checks it and, if it fired, closes the new
+ * link without handling its error (an unhandled rejection when the entity
+ * rejects the link). Returns `finish()`, which ends the attach, and `result`.
+ */
+function attachInProgress(receiver) {
+  const signal = receiver.subscribeOptions.abortSignal;
+  let finish;
+  const result = {};
+  const attaching = new Promise((resolve) => (finish = resolve)).then(() => {
+    result.abortedWhenAttached = signal.aborted;
+  });
+  const close = receiver.close;
+  receiver.close = async () => {
+    await attaching;
+    await close.call(receiver);
+  };
+  return { finish, result, signal };
+}
+
+test("server close() cancels the SDK's retries only once no link is being attached", async () => {
+  const fake = fakeServiceBusClient();
+  const server = serverWith(fake, {
+    type: "queue",
+    metaOptions: { queueName: "missing", receiveMode: "peekLock" },
+  });
+  await listen(server);
+  const receiver = fake.receivers[0];
+  const { finish, result, signal } = attachInProgress(receiver);
+
+  const closing = server.close();
+  await ticks();
+  finish();
+  await closing;
+  assert.equal(result.abortedWhenAttached, false, "close() aborted while the SDK attached a link");
+  assert.equal(signal.aborted, true, "close() did not cancel the SDK's retries");
+  assert.equal(receiver.closed, true);
+  assert.equal(fake.closed, true);
+});
+
+test("server close() logs, and does not throw, a connection that fails to close", async () => {
+  const fake = fakeServiceBusClient();
+  const logged = [];
+  const server = serverWith(fake, { type: "queue", metaOptions: { queueName: "q" } });
+  server.logger = silentLogger(logged);
+  // What rhea (under the SDK) rejects with: a plain AMQP error, not an Error.
+  const amqpError = { condition: "amqp:not-found", description: "The entity could not be found" };
+  fake.client.close = async () => {
+    throw amqpError;
+  };
+  await listen(server);
+  fake.receivers[0].close = async () => {
+    throw amqpError;
+  };
+
+  await server.close();
+  const errors = logged.filter((e) => e.level === "error").map((e) => String(e.args[0]));
+  assert.equal(errors.length, 2, errors.join("\n"));
+  assert.match(errors[0], /Could not close an Azure Service Bus receiver: .*amqp:not-found/);
+  assert.match(errors[1], /Could not close the Azure Service Bus connection: .*amqp:not-found/);
+  assert.throws(() => server.unwrap(), /Not initialized/);
+  assert.equal(server.receivers.size, 0);
 });
 
 // --- What util.inspect() shows ------------------------------------------------

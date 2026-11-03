@@ -5,7 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.2.0] - 2026-11-02
+## [2.0.0] - 2026-11-03
+
+The same code as 1.2.0, published as a major version. 1.2.0 contains breaking
+changes (`@azure/service-bus` became a peer dependency, client methods were
+removed, typings and behaviors changed), so under Semantic Versioning it had
+to be a major version: an application that depends on `^1.1.0` could receive
+it without asking for it. 1.2.0 is deprecated on npm.
+
+Upgrading from 1.1.0: read the 1.2.0 entry below, and its **Behavior changes**
+and **Upgrading from 1.1.0** sections. What it says about 1.2.0 applies to
+2.0.0 too, and a 1.2.0 and a 2.0.0 client or server work together exactly
+like two 2.0.0 ones.
+
+### Added
+
+- `RELEASING.md`: how versions are numbered and released.
+
+## [1.2.0] - 2026-11-03
 
 ### Added
 
@@ -334,5 +351,6 @@ Read these before upgrading a service that relies on the 1.1.0 behavior.
 
 Last release before this changelog was started.
 
+[2.0.0]: https://github.com/Niurmiguel/nestjs-service-bus/compare/1.2.0...2.0.0
 [1.2.0]: https://github.com/Niurmiguel/nestjs-service-bus/compare/1.1.0...1.2.0
 [1.1.0]: https://github.com/Niurmiguel/nestjs-service-bus/releases/tag/1.1.0

@@ -9,9 +9,13 @@ const assert = require("node:assert/strict");
 const { lastValueFrom } = require("rxjs");
 const { randomUUID } = require("node:crypto");
 const { ServiceBusError } = require("@azure/service-bus");
-const { PATTERN_METADATA } = require("@nestjs/microservices/constants");
+const { Controller, Module } = require("@nestjs/common");
+const { ClientProxyFactory, MessagePattern, Transport } = require("@nestjs/microservices");
+const { PATTERN_METADATA, TRANSPORT_METADATA } = require("@nestjs/microservices/constants");
 
+const { freePort, startHybridApp } = require("./hybrid-app");
 const {
+  AZURE_SERVICE_BUS_TRANSPORT,
   AzureServiceBusClient,
   AzureServiceBusContext,
   AzureServiceBusModule,
@@ -24,6 +28,7 @@ const {
   SB_REPLY_DISPOSED_PROPERTY,
   SB_REPLY_TYPE_PROPERTY,
   SB_REQUEST_ID_PROPERTY,
+  SB_SUBSCRIBER_EXTRA,
   SB_SUBSCRIBER_METADATA,
 } = require("../dist/azure-service-bus.constants");
 
@@ -1077,12 +1082,176 @@ test("a failed listen() closes what it opened and reports the error", async () =
   const server = serverWith(
     fake,
     { type: "queue", metaOptions: { queueName: "ok" } },
-    "not-a-service-bus-pattern"
+    { type: "queue", metaOptions: { receiveMode: "peekLock", broken: true } }
   );
 
-  await assert.rejects(listen(server), /not-a-service-bus-pattern/);
+  await assert.rejects(listen(server), /broken.*needs a "queueName"/);
   assert.equal(fake.receivers[0].closed, true);
   assert.equal(fake.closed, true);
+});
+
+/** A controller declared the way a TypeScript user would, from plain functions. */
+function controllerWith(handlers) {
+  class Handlers {}
+  for (const [name, { decorator, fn }] of Object.entries(handlers)) {
+    Object.defineProperty(Handlers.prototype, name, { value: fn, writable: true, configurable: true });
+    decorator(Handlers.prototype, name, Object.getOwnPropertyDescriptor(Handlers.prototype, name));
+  }
+  Controller()(Handlers);
+  return Handlers;
+}
+
+/** A module with the handlers of a hybrid app: this transport's, TCP's and undeclared ones. */
+function hybridModule(received) {
+  const handlers = controllerWith({
+    onJob: { decorator: Queue({ queueName: "jobs", receiveMode: "peekLock" }), fn: (m) => received.push(m) },
+    onOrder: {
+      decorator: Subscription({ topic: "orders", subscription: "billing", receiveMode: "peekLock" }),
+      fn: (m) => received.push(m),
+    },
+    // No transport: Nest registers it on every server of the app, this one included.
+    sum: { decorator: MessagePattern({ cmd: "sum" }), fn: (numbers) => numbers.reduce((a, b) => a + b, 0) },
+    // TCP only.
+    ping: { decorator: MessagePattern({ cmd: "ping" }, Transport.TCP), fn: () => "pong" },
+  });
+  class AppModule {}
+  Module({ controllers: [handlers] })(AppModule);
+  return AppModule;
+}
+
+const TCP_ONLY_PATTERN = '{"cmd":"ping"}';
+const UNDECLARED_PATTERN = '{"cmd":"sum"}';
+
+test("a hybrid app (#216): only @Queue/@Subscription handlers open receivers, and TCP keeps its own", async () => {
+  // The server as given, and a subclass of it: both are used as `strategy`.
+  class CustomServer extends AzureServiceBusServer {}
+  for (const ServerClass of [AzureServiceBusServer, CustomServer]) {
+    const fake = fakeServiceBusClient();
+    const server = new ServerClass({ connectionString: CONNECTION_STRING });
+    server.createServiceBusClient = () => fake.client;
+    const logged = [];
+    server.logger = silentLogger(logged);
+    const port = await freePort();
+    const received = [];
+
+    const app = await startHybridApp(hybridModule(received), [
+      { strategy: server },
+      { transport: Transport.TCP, options: { host: "127.0.0.1", port } },
+    ]);
+    const tcp = ClientProxyFactory.create({ transport: Transport.TCP, options: { host: "127.0.0.1", port } });
+    try {
+      // This server: a receiver for each of its handlers, and nothing else.
+      assert.deepEqual(
+        fake.receivers.map(({ args }) => args.slice(0, args.length - 1)).sort(),
+        [["jobs"], ["orders", "billing"]]
+      );
+      const patterns = [...server.getHandlers().keys()];
+      assert.ok(!patterns.includes(TCP_ONLY_PATTERN), "a TCP handler reached this server");
+      // A handler without transport reaches every server; this one ignores it
+      // and says so once, at debug level.
+      assert.ok(patterns.includes(UNDECLARED_PATTERN));
+      const ignored = logged.filter(({ args }) => String(args[0]).includes('{\\"cmd\\":\\"sum\\"}'));
+      assert.equal(ignored.length, 1, JSON.stringify(logged));
+      assert.equal(ignored[0].level, "debug");
+      assert.deepEqual(logged.filter(({ level }) => level !== "debug"), []);
+
+      // The TCP server: its handlers, and none of this transport's.
+      assert.equal(await lastValueFrom(tcp.send({ cmd: "ping" }, {})), "pong");
+      assert.equal(await lastValueFrom(tcp.send({ cmd: "sum" }, [1, 2, 3])), 6);
+      const ours = JSON.parse([...patterns].find((p) => p.includes('"queueName":"jobs"')));
+      await assert.rejects(lastValueFrom(tcp.send(ours, {})), /no matching message handler/);
+
+      // A message for this transport still reaches its handler.
+      const [jobs] = fake.receivers.filter(({ args }) => args[0] === "jobs");
+      jobs.completeMessage = async () => {};
+      await jobs.handlers.processMessage({ body: { n: 1 }, messageId: "m1" });
+      assert.deepEqual(received.map((m) => m.body), [{ n: 1 }]);
+
+      // listen() again: no second receiver, no second log line.
+      await listen(server);
+      assert.equal(fake.receivers.length, 2);
+      assert.equal(logged.length, 1);
+    } finally {
+      await tcp.close();
+      await app.close();
+    }
+    assert.equal(fake.closed, true);
+  }
+});
+
+test("server.transportId is AZURE_SERVICE_BUS_TRANSPORT, which @Queue and @Subscription declare", () => {
+  const server = new AzureServiceBusServer({ connectionString: CONNECTION_STRING });
+  assert.equal(typeof AZURE_SERVICE_BUS_TRANSPORT, "symbol");
+  assert.equal(server.transportId, AZURE_SERVICE_BUS_TRANSPORT);
+  // A registered symbol: a second copy of this package in node_modules still matches.
+  assert.equal(AZURE_SERVICE_BUS_TRANSPORT, Symbol.for(Symbol.keyFor(AZURE_SERVICE_BUS_TRANSPORT)));
+
+  class Handlers {
+    onJob() {}
+    onOrder() {}
+  }
+  for (const [key, decorator] of [
+    ["onJob", Queue({ queueName: "jobs" })],
+    ["onOrder", Subscription({ topic: "t", subscription: "s" })],
+  ]) {
+    const descriptor = Object.getOwnPropertyDescriptor(Handlers.prototype, key);
+    decorator(Handlers.prototype, key, descriptor);
+    assert.equal(Reflect.getMetadata(TRANSPORT_METADATA, descriptor.value), AZURE_SERVICE_BUS_TRANSPORT);
+  }
+});
+
+test("bindEvents() ignores the patterns of other transports, logging each once at debug level", async () => {
+  const fake = fakeServiceBusClient();
+  const server = serverWith(
+    fake,
+    { type: "queue", metaOptions: { queueName: "jobs" } },
+    "plain-string",
+    { cmd: "sum" },
+    42,
+    { metaOptionsLike: { queueName: "not-ours" } }
+  );
+  const logged = [];
+  server.logger = silentLogger(logged);
+
+  await listen(server);
+  await listen(server);
+  assert.deepEqual(fake.receivers.map(({ args }) => args[0]), ["jobs"]);
+  assert.deepEqual(
+    logged.map(({ level }) => level),
+    ["debug", "debug", "debug", "debug"]
+  );
+  assert.match(String(logged[0].args[0]), /plain-string/);
+  await server.close();
+});
+
+test("bindEvents() still fails, clearly, on this transport's handlers it cannot read", async () => {
+  const cases = [
+    // metaOptions without an entity.
+    [{ type: "queue", metaOptions: { receiveMode: "peekLock" } }, {}, /needs a "queueName", or a "topic" and a "subscription"/],
+    // metaOptions that is not an object.
+    [{ type: "queue", metaOptions: "jobs" }, {}, /has no Azure Service Bus options/],
+    // From @Queue/@Subscription (marked in the handler's extras), but not JSON:
+    // a factory, or an option set to undefined.
+    [
+      { type: "queue", metaFactory: () => ({ queueName: "jobs" }) },
+      { [SB_SUBSCRIBER_EXTRA]: true },
+      /Cannot read the Azure Service Bus options/,
+    ],
+    [
+      { type: "queue", metaOptions: { queueName: "jobs", subQueueType: undefined } },
+      { [SB_SUBSCRIBER_EXTRA]: true },
+      /Cannot read the Azure Service Bus options/,
+    ],
+  ];
+  for (const [pattern, extras, error] of cases) {
+    const fake = fakeServiceBusClient();
+    const server = new AzureServiceBusServer({ connectionString: CONNECTION_STRING });
+    server.createServiceBusClient = () => fake.client;
+    server.logger = silentLogger();
+    server.addHandler(pattern, async () => {}, true, extras);
+    await assert.rejects(listen(server), error);
+    assert.equal(fake.closed, true);
+  }
 });
 
 test("server processError resolves (the SDK awaits it)", async () => {

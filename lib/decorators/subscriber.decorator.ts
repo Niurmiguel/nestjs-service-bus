@@ -1,6 +1,10 @@
 import { EventPattern } from "@nestjs/microservices";
 
-import { SB_SUBSCRIBER_METADATA } from "../azure-service-bus.constants";
+import {
+  AZURE_SERVICE_BUS_TRANSPORT,
+  SB_SUBSCRIBER_EXTRA,
+  SB_SUBSCRIBER_METADATA,
+} from "../azure-service-bus.constants";
 import { SbSubscriberMetadata } from "../metadata";
 import {
   MetaOrMetaFactory,
@@ -40,7 +44,11 @@ function subscriber<T extends keyof SbSubscriberTypeMap>(
     storeMetadata(target, key, sbSubscriberMetadata);
 
     if (descriptor) {
-      return EventPattern(sbSubscriberMetadata)(target, key, descriptor);
+      // Declared for this transport only: in a hybrid application NestJS does
+      // not register the handler on the other transports' servers.
+      return EventPattern(sbSubscriberMetadata, AZURE_SERVICE_BUS_TRANSPORT, {
+        [SB_SUBSCRIBER_EXTRA]: true,
+      })(target, key, descriptor);
     }
   };
 }

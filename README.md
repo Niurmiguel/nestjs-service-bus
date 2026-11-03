@@ -312,6 +312,7 @@ It waits for up to `closeTimeoutInMs` (25 seconds by default), including the res
 
 - A handler still running has its message left unsettled: in `peekLock` mode Service Bus delivers it again once its lock expires (in `receiveAndDelete` mode it is gone).
 - A streamed response whose request already had its first reply (so its message was completed) just stops: its client gets no further replies and, with `replyTimeoutInMs` set, fails after it.
+- A reply still being sent gets up to one more second, and is then cancelled before the connection is closed (a send left running under a closed connection would keep the process alive). If it was the first reply of its request, the message is left unsettled, as above.
 
 The default leaves a few seconds before Kubernetes' default `terminationGracePeriodSeconds` (30 seconds) for the rest of the shutdown. Keep it shorter than the time your platform gives a process to stop, or set `Infinity` to wait for as long as the handlers take.
 

@@ -145,6 +145,10 @@ Besides `connectionString` and `options`, each client (an entry of `forRoot()`/`
     <td><code>replySessions</code></td>
     <td>Receive the replies in a session of this client's own. Use it when several clients (e.g. several replicas of a service) send requests to the same entity: see <a href="#request-response">Request-response</a>. Default <code>false</code>.</td>
   </tr>
+  <tr>
+    <td><code>closeTimeoutInMs</code></td>
+    <td>How long <code>close()</code> waits for the <code>send()</code>/<code>emit()</code> calls whose message is still being sent before it cancels them. <code>5000</code> (5 seconds) by default; <code>0</code> cancels them at once, <code>Infinity</code> waits for as long as they take. From <code>0</code> to <code>2147483647</code>; another value throws a <code>RangeError</code>. See <a href="#shutdown">Shutdown</a>.</td>
+  </tr>
 </table>
 
 ##### Producer
@@ -192,7 +196,7 @@ this.sbClient.emit(pattern, data);
 - If a reply cannot be sent, the server logs it at once, unsubscribes the response and sends the client an error reply instead of the rest (Nest's generic `{ status: 'error', message: 'Internal server error' }`). If that error reply cannot be sent either, the client gets nothing more: only its `replyTimeoutInMs` ends the wait.
 - If the handler fails, the Observable fails with the error Nest's exception filter makes of it, as in Nest's other transports: `{ status: 'error', message: 'Internal server error' }` for an unknown error, or the payload of an `RpcException`.
 - If the request cannot be sent (e.g. the entity does not exist), or the reply queue cannot be received from (it does not exist, or its sessions setting does not match `replySessions`), the Observable fails.
-- `close()` waits for the sends in flight and fails the `send()` calls still waiting for a reply.
+- `close()` waits for the sends in flight (up to the client's `closeTimeoutInMs`, see [Shutdown](#shutdown)) and fails the `send()` calls still waiting for a reply.
 - Set `replyTimeToLiveInMs` on the server and `replyTimeoutInMs` on the client (see the options above), so that neither a reply nobody waits for nor a request nobody answers stays around for ever.
 
 When several clients send to the same entity they share `<name>.reply`. Without sessions, a client that receives a reply to a request it did not send abandons it, so that Service Bus delivers it again, possibly to the client it belongs to; a reply can bounce several times, and after the queue's max delivery count it is dead-lettered. (A reply whose `correlationId` is not a request id at all is dead-lettered at once, with the reason `InvalidCorrelationId`.) The warning about those replies is logged at most once a minute.
@@ -315,6 +319,10 @@ It waits for up to `closeTimeoutInMs` (25 seconds by default), including the res
 - A reply still being sent gets up to one more second, and is then cancelled before the connection is closed (a send left running under a closed connection would keep the process alive). If it was the first reply of its request, the message is left unsettled, as above.
 
 The default leaves a few seconds before Kubernetes' default `terminationGracePeriodSeconds` (30 seconds) for the rest of the shutdown. Keep it shorter than the time your platform gives a process to stop, or set `Infinity` to wait for as long as the handlers take.
+
+A client (`AzureServiceBusClient`, or the clients of `AzureServiceBusModule`) closes with the application too. Its `close()` waits for the `send()`/`emit()` calls whose message is still being sent, for up to its own `closeTimeoutInMs` (5 seconds by default), and then cancels them: their Observables fail with an error that starts with `close() cancelled the send to "<entity>"`, a warning is logged, and the connection is closed. A cancelled message may or may not have reached Service Bus (the broker may have taken it without the answer arriving in time), so treat it as you would any failed send. A send that finishes in time is not affected, and with nothing in flight `close()` does not wait at all.
+
+The SDK cannot cancel a link it is still attaching (a send's, or a reply receiver's, when the entity is slow to answer): `close()` then gives it up to one more second, goes on without it and warns. The connection is closed once the SDK gives that attach up (up to a minute), not under it, so the process stays alive until then. Both time limits add up during `app.close()`: keep the client's and the server's `closeTimeoutInMs` together under your platform's grace period.
 
 ##### Hybrid applications
 

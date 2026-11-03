@@ -219,20 +219,52 @@ test("client.emit sends the message through a sender and closes it", { timeout: 
   assert.deepEqual(createdFor, ["orders"]);
   assert.equal(sender.sent.length, 1);
   assert.deepEqual(sender.sent[0].messages, { body: "hello" });
-  assert.deepEqual(sender.sent[0].options, sendOptions);
+  // The options as given, plus a signal of the send's own (close() cancels it).
+  const { abortSignal, ...given } = sender.sent[0].options;
+  assert.deepEqual(given, sendOptions);
+  assert.ok(abortSignal instanceof AbortSignal);
   assert.equal(sender.closed, true);
 });
 
-test("client.emit hands the send options to the SDK as given (AbortSignal included)", async () => {
-  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
-  const sender = fakeSender();
-  client.sbClient = { createSender: () => sender };
+/** A sendMessages() for fakeClientSdk() that only ends when its abortSignal fires. */
+function sendUntilAborted(record = []) {
+  return (sender, messages, options) => {
+    const send = { messages, signal: options?.abortSignal, settled: false };
+    record.push(send);
+    return new Promise((resolve, reject) => {
+      const abort = () => {
+        send.settled = true;
+        reject(Object.assign(new Error("The operation was aborted."), { name: "AbortError" }));
+      };
+      if (send.signal?.aborted) abort();
+      else send.signal?.addEventListener("abort", abort);
+    });
+  };
+}
 
-  const abortSignal = new AbortController().signal;
-  await lastValueFrom(client.emit({ name: "orders", options: { abortSignal } }, { body: 1 }), {
-    defaultValue: undefined,
-  });
-  assert.equal(sender.sent[0].options.abortSignal, abortSignal);
+test("client.emit: the caller's abortSignal (in the send options) cancels the send", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  client.logger = silentLogger();
+  const sends = [];
+  client.sbClient = fakeClientSdk({ sendMessages: sendUntilAborted(sends) });
+
+  const caller = new AbortController();
+  const emitted = lastValueFrom(
+    client.emit({ name: "orders", options: { abortSignal: caller.signal } }, { body: 1 }),
+    { defaultValue: undefined }
+  );
+  await ticks();
+  assert.equal(sends[0].signal.aborted, false);
+  caller.abort();
+  // The SDK's own error, not close()'s.
+  await assert.rejects(emitted, { name: "AbortError", message: "The operation was aborted." });
+
+  // Already aborted when the send starts.
+  await assert.rejects(
+    lastValueFrom(client.emit({ name: "orders", options: { abortSignal: caller.signal } }, { body: 2 })),
+    { name: "AbortError" }
+  );
+  assert.equal(sends[1].signal.aborted, true);
 });
 
 test("client.emit accepts send options with undefined values", async () => {
@@ -262,7 +294,9 @@ test("client.send hands the send options to the SDK as given", async () => {
   for (let i = 0; i < 20 && sender.sent.length === 0; i++) await new Promise((r) => setImmediate(r));
   subscription.unsubscribe();
   assert.equal(sender.sent.length, 1);
-  assert.equal(sender.sent[0].options.abortSignal, abortSignal);
+  assert.ok("tracingOptions" in sender.sent[0].options);
+  // A signal of the send's own, which the caller's aborts (see the test above).
+  assert.ok(sender.sent[0].options.abortSignal instanceof AbortSignal);
 });
 
 test("client.emit with no subscriber logs a send that fails", async () => {
@@ -333,6 +367,187 @@ test("client.close waits for the sends in flight", async () => {
   await closing;
   assert.equal(sdk.senders[0].closed, true);
   assert.equal(sdk.closed, true);
+});
+
+/** Resolves to "closed", or to "still waiting" if close() takes more than `ms`. */
+const clientClosedWithin = (client, ms) =>
+  Promise.race([
+    client.close().then(() => "closed"),
+    new Promise((resolve) => setTimeout(resolve, ms, "still waiting").unref()),
+  ]);
+
+test("client close() cancels the sends still in flight after closeTimeoutInMs, and their callers fail", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING, closeTimeoutInMs: 100 });
+  const logged = [];
+  client.logger = silentLogger(logged);
+  const sends = [];
+  const sdk = fakeClientSdk({ sendMessages: sendUntilAborted(sends) });
+  let atClose;
+  sdk.close = async () => {
+    atClose = { unsettled: sends.filter((s) => !s.settled).length, sendersOpen: sdk.senders.filter((s) => !s.closed).length };
+    sdk.closed = true;
+  };
+  client.sbClient = sdk;
+
+  const emitted = collect(client.emit({ name: "events" }, { body: 1 }));
+  const sent = collect(client.send({ name: "rpc" }, { body: 2 }));
+  await ticks();
+  assert.equal(sends.length, 2);
+
+  const started = Date.now();
+  assert.equal(await clientClosedWithin(client, 5_000), "closed");
+  const took = Date.now() - started;
+  assert.ok(took >= 90 && took < 1_000, `close() took ${took} ms`);
+  assert.deepEqual(atClose, { unsettled: 0, sendersOpen: 0 }, "the connection was closed under a send");
+
+  await Promise.all([emitted.done, sent.done]);
+  for (const [{ events }, name] of [[emitted, "events"], [sent, "rpc"]]) {
+    assert.equal(events.length, 1, JSON.stringify(events));
+    const [kind, err] = events[0];
+    assert.equal(kind, "error");
+    assert.match(err.message, new RegExp(`^close\\(\\) cancelled the send to "${name}": .*closeTimeoutInMs \\(100 ms\\)`));
+    assert.equal(err.cause?.name, "AbortError");
+  }
+  const warnings = logged.filter((e) => e.level === "warn").map((e) => String(e.args[0]));
+  assert.equal(warnings.length, 1, JSON.stringify(warnings));
+  assert.match(warnings[0], /close\(\) cancelled 2 send\(s\) still in flight after closeTimeoutInMs \(100 ms\)\.$/);
+});
+
+test("client close() does not hang on a cancelled send whose sender does not close; it warns once", async () => {
+  // As the SDK does with a link still being attached: sendMessages() gives up
+  // on abort, but closing the sender waits for the attach (up to 60 s).
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING, closeTimeoutInMs: 100 });
+  const logged = [];
+  client.logger = silentLogger(logged);
+  const sdk = fakeClientSdk({ sendMessages: sendUntilAborted() });
+  const createSender = sdk.createSender;
+  let attached;
+  const attaching = new Promise((resolve) => (attached = resolve));
+  sdk.createSender = (name) => Object.assign(createSender(name), { close: () => attaching });
+  client.sbClient = sdk;
+
+  const a = collect(client.emit({ name: "events" }, { body: 1 }));
+  await ticks();
+  const started = Date.now();
+  assert.equal(await clientClosedWithin(client, 5_000), "closed");
+  const took = Date.now() - started;
+  assert.ok(took < 2_000, `close() took ${took} ms`);
+  // Not under the link still being attached: once the SDK is done with it.
+  assert.equal(sdk.closed, false);
+  attached();
+  await ticks();
+  assert.equal(sdk.closed, true);
+  // The caller was told when the send was cancelled, not when its sender closed.
+  assert.equal(a.events[0]?.[0], "error");
+  assert.match(a.events[0][1].message, /^close\(\) cancelled the send to "events"/);
+  const warnings = logged.filter((e) => e.level === "warn").map((e) => String(e.args[0]));
+  assert.equal(warnings.length, 1, JSON.stringify(warnings));
+  assert.match(warnings[0], /cancelled 1 send\(s\) .*; 1 did not stop .*: the connection is closed once the SDK gives them up/);
+});
+
+test("client close() does not hang on a reply receiver that does not close; it warns", async () => {
+  // As the SDK does with a reply link still being attached: closing the
+  // receiver waits for the attach (up to 60 s).
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING, closeTimeoutInMs: 100 });
+  const logged = [];
+  client.logger = silentLogger(logged);
+  const sdk = fakeClientSdk();
+  const createReceiver = sdk.createReceiver;
+  let attached;
+  const attaching = new Promise((resolve) => (attached = resolve));
+  sdk.createReceiver = (...args) => Object.assign(createReceiver(...args), { close: () => attaching });
+  client.sbClient = sdk;
+
+  const a = collect(client.send({ name: "rpc" }, { body: 1 }));
+  await ticks();
+  const started = Date.now();
+  assert.equal(await clientClosedWithin(client, 5_000), "closed");
+  const took = Date.now() - started;
+  // At least one second for the receivers, even past closeTimeoutInMs.
+  assert.ok(took >= 900 && took < 2_000, `close() took ${took} ms`);
+  assert.equal(sdk.closed, false, "the connection was closed under a link being attached");
+  attached();
+  await ticks();
+  assert.equal(sdk.closed, true);
+  await a.done;
+  assert.match(a.events[0][1].message, /closed before the reply/);
+  const warnings = logged.filter((e) => e.level === "warn").map((e) => String(e.args[0]));
+  assert.equal(warnings.length, 1, JSON.stringify(warnings));
+  assert.match(warnings[0], /did not wait for 1 reply receiver\(s\) still being closed after closeTimeoutInMs \(100 ms\)/);
+});
+
+test("client close() with closeTimeoutInMs: 0 cancels at once; with Infinity it waits for the send", async () => {
+  const cancelled = new AzureServiceBusClient({ connectionString: CONNECTION_STRING, closeTimeoutInMs: 0 });
+  cancelled.logger = silentLogger();
+  cancelled.sbClient = fakeClientSdk({ sendMessages: sendUntilAborted() });
+  const a = collect(cancelled.emit({ name: "events" }, { body: 1 }));
+  await ticks();
+  assert.equal(await clientClosedWithin(cancelled, 500), "closed");
+  await a.done;
+  assert.match(a.events[0][1].message, /closeTimeoutInMs \(0 ms\)/);
+
+  const patient = new AzureServiceBusClient({ connectionString: CONNECTION_STRING, closeTimeoutInMs: Infinity });
+  patient.logger = silentLogger();
+  let finishSend;
+  const sends = [];
+  patient.sbClient = fakeClientSdk({
+    sendMessages: (sender, messages, options) => {
+      sends.push(options.abortSignal);
+      return new Promise((resolve) => (finishSend = resolve));
+    },
+  });
+  const b = collect(patient.emit({ name: "events" }, { body: 1 }));
+  await ticks();
+  const closing = clientClosedWithin(patient, 5_000);
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  assert.equal(sends[0].aborted, false);
+  finishSend();
+  assert.equal(await closing, "closed");
+  await b.done;
+  assert.deepEqual(b.events, [["next", undefined], ["complete"]]);
+});
+
+test("client closeTimeoutInMs defaults to 5 s; out of a timer's range it throws a RangeError", () => {
+  assert.equal(new AzureServiceBusClient({ connectionString: CONNECTION_STRING }).closeTimeoutInMs, 5_000);
+  for (const closeTimeoutInMs of [-1, NaN, 2 ** 31, "1000", null]) {
+    assert.throws(
+      () => new AzureServiceBusClient({ connectionString: CONNECTION_STRING, closeTimeoutInMs }),
+      RangeError,
+      String(closeTimeoutInMs)
+    );
+  }
+});
+
+test("client close() with nothing in flight does not wait", async () => {
+  const client = new AzureServiceBusClient({ connectionString: CONNECTION_STRING });
+  client.logger = silentLogger();
+  const sdk = fakeClientSdk();
+  client.sbClient = sdk;
+  await lastValueFrom(client.emit({ name: "events" }, { body: 1 }), { defaultValue: undefined });
+  const started = Date.now();
+  await client.close();
+  assert.ok(Date.now() - started < 50, `close() took ${Date.now() - started} ms`);
+  assert.equal(sdk.closed, true);
+});
+
+test("the process exits on its own after the client's close() cancels a send that hangs", async () => {
+  const { spawn } = require("node:child_process");
+  const path = require("node:path");
+  const child = spawn(process.execPath, [path.join(__dirname, "client-close-exit.js")], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let output = "";
+  child.stdout.on("data", (chunk) => (output += chunk));
+  child.stderr.on("data", (chunk) => (output += chunk));
+  const exited = new Promise((resolve) => child.once("exit", (code) => resolve(code)));
+  const outcome = await Promise.race([
+    exited,
+    new Promise((resolve) => setTimeout(resolve, 5000, "still running").unref()),
+  ]);
+  if (outcome === "still running") child.kill("SIGKILL");
+  assert.equal(outcome, 0, output);
+  assert.match(output, /^closed$/m);
+  assert.match(output, /^send=error: close\(\) cancelled the send/m);
 });
 
 test("a receiver that fails to close is logged, not left as an unhandled rejection", async () => {

@@ -46,6 +46,7 @@ const clientOptions: AzureServiceBusClientOptions = {
   connectionString: "Endpoint=sb://localhost;SharedAccessKeyName=k;SharedAccessKey=v",
   replyTimeoutInMs: 30_000,
   replySessions: true,
+  closeTimeoutInMs: 3_000,
 };
 const serverOptions: AzureServiceBusServerOptions = {
   connectionString: clientOptions.connectionString,

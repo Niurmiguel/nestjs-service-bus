@@ -315,6 +315,22 @@ It waits for up to `closeTimeoutInMs` (25 seconds by default), including the res
 
 The default leaves a few seconds before Kubernetes' default `terminationGracePeriodSeconds` (30 seconds) for the rest of the shutdown. Keep it shorter than the time your platform gives a process to stop, or set `Infinity` to wait for as long as the handlers take.
 
+##### Hybrid applications
+
+The server can run next to other transports in a [hybrid application](https://docs.nestjs.com/faq/hybrid-application):
+
+```typescript
+app.connectMicroservice<MicroserviceOptions>({
+  strategy: new AzureServiceBusServer({ connectionString: process.env.SERVICE_BUS_CONNECTION_STRING! }),
+});
+app.connectMicroservice<MicroserviceOptions>({ transport: Transport.TCP, options: { port: 3001 } });
+await app.startAllMicroservices();
+```
+
+- `@Subscription()` and `@Queue()` declare the transport `AZURE_SERVICE_BUS_TRANSPORT` (exported; it is the server's `transportId`), so NestJS registers them on this server only. A subclass of `AzureServiceBusServer` keeps that `transportId`; if it sets another one, those handlers are no longer registered on it.
+- NestJS registers the handlers that declare no transport, such as `@MessagePattern({ cmd: 'sum' })`, on every server of the application. This server ignores those that are not its own (with a debug log), but the other servers still get them: declare their transport (`@MessagePattern({ cmd: 'sum' }, Transport.TCP)`) to keep them where they belong.
+- NestJS only filters by transport when the server declares a `transportId`: a server of another custom transport that has none gets every handler, this transport's included.
+
 ## Security
 
 **Give each side only the rights it needs.** Use the Microsoft Entra roles *Azure Service Bus Data Sender* / *Azure Service Bus Data Receiver* assigned to each entity, or shared access policies (SAS) defined on each queue or topic:

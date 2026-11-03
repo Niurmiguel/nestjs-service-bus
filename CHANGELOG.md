@@ -213,7 +213,13 @@ Read these before upgrading a service that relies on the 1.1.0 behavior.
   still running are unsubscribed and the receivers are closed anyway: in
   `peekLock` mode the messages of the handlers still running are delivered
   again once their lock expires, while a streamed response whose request was
-  already completed just ends (its client gets no further replies). Set
+  already completed just ends (its client gets no further replies). The
+  replies such a response had queued are dropped, and one still being sent
+  gets up to one more second and is then cancelled (with the `abortSignal` of
+  `sendMessages()`) before the connection is closed: closing the connection
+  under a send leaves the SDK's timers of that send running, and they kept the
+  process alive for up to a minute after `close()`. A first reply cancelled
+  this way leaves its request unsettled, so it is delivered again. Set
   `closeTimeoutInMs: Infinity` to wait for as long as the handlers take.
   A receiver that is still trying to connect (e.g. its entity does not exist)
   adds up to one second. A receiver or the connection that fails to close is
@@ -236,7 +242,9 @@ Read these before upgrading a service that relies on the 1.1.0 behavior.
   with an unhandled rejection, a bug of the SDK fixed in 7.10.0. One case is
   left: a `replySessions` client that closes while it is still accepting its
   reply session cancels that call, so prefer 7.10.0 or later with
-  `replySessions`.
+  `replySessions`. The same goes, on the server, for a reply that `close()`
+  cancels while its link is still being attached (only after
+  `closeTimeoutInMs` and one more second).
 - **`replyTimeoutInMs`** out of range (negative, `NaN`, not a number, or more
   than 2147483647) throws a `RangeError` when the client is created. Before, a
   value above 2147483647 (or `Infinity`) made every `send()` time out at once,

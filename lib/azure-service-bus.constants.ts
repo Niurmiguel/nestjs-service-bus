@@ -1,5 +1,26 @@
 export const SB_SUBSCRIBER_METADATA = "service_bus_subscriber_metadata";
 
+/**
+ * The `transportId` of `AzureServiceBusServer`, which `@Subscription()` and
+ * `@Queue()` declare as their transport. In a hybrid application NestJS then
+ * registers those handlers only on this transport's servers (and on servers
+ * that declare no `transportId`), and handlers declared for another transport
+ * (e.g. `@MessagePattern(pattern, Transport.TCP)`) never reach this one.
+ *
+ * A registered symbol (`Symbol.for()`), so that it is the same even when an
+ * application ends up with two copies of this package.
+ */
+export const AZURE_SERVICE_BUS_TRANSPORT: unique symbol = Symbol.for(
+  "@niur/nestjs-service-bus/transport"
+);
+
+/**
+ * Key of the handler extras that `@Subscription()` and `@Queue()` set, so the
+ * server knows those handlers are its own even when their pattern cannot be
+ * read (and must fail) rather than belonging to another transport.
+ */
+export const SB_SUBSCRIBER_EXTRA = "nestjs-sb-subscriber";
+
 /*
  * Request-response over Service Bus. The client sends the request to
  * `<entity>` with `replyTo: "<entity>.reply"`; the server answers on that

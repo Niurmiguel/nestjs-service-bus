@@ -1,9 +1,11 @@
 // Compile-time tests: this file must compile (`tsc -p test/types`), and each
 // `@ts-expect-error` line must fail to compile. Nothing here runs.
 import { ServiceBusMessageBatch, ServiceBusReceivedMessage } from "@azure/service-bus";
+import { CustomTransportStrategy, MessagePattern, Transport } from "@nestjs/microservices";
 import { Observable } from "rxjs";
 
 import {
+  AZURE_SERVICE_BUS_TRANSPORT,
   AllowedReplyTo,
   AzureServiceBusClient,
   AzureServiceBusClientOptions,
@@ -15,6 +17,7 @@ import {
   AzureServiceBusServer,
   AzureServiceBusServerOptions,
   MetaOrMetaFactory,
+  Queue,
   SbQueueMetadataOptions,
   SbReceiverMetadataOptions,
   SbSubscriberMetadata,
@@ -74,6 +77,23 @@ const args: AzureServiceBusContextArgs = [];
 const sendable: SendableMessages = batch;
 const request: SendableRequest = { body: 1 };
 
+// Hybrid applications: the transport id is exported, for handlers declared
+// by hand for this transport, and the server is still a custom strategy.
+const transport: symbol = AZURE_SERVICE_BUS_TRANSPORT;
+const strategy: CustomTransportStrategy = new AzureServiceBusServer(serverOptions);
+const transportId: Transport | symbol | undefined = new AzureServiceBusServer(serverOptions).transportId;
+class HybridHandlers {
+  @Queue({ queueName: "jobs", receiveMode: "peekLock" })
+  onJob(): void {}
+
+  @MessagePattern({ cmd: "sum" }, Transport.TCP)
+  sum(numbers: number[]): number {
+    return numbers.reduce((a, b) => a + b, 0);
+  }
+}
+class CustomServer extends AzureServiceBusServer {}
+const custom: CustomTransportStrategy = new CustomServer(serverOptions);
+
 // Reading the stored decorator metadata: metaOptions is a union since @Queue.
 declare const stored: SubscriberMetadataForTarget;
 const names = stored.map(({ metadata }) =>
@@ -94,4 +114,9 @@ export {
   sendable,
   request,
   names,
+  transport,
+  strategy,
+  transportId,
+  HybridHandlers,
+  custom,
 };

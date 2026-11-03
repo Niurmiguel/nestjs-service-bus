@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that are running (25 seconds by default; see "Behavior changes").
 - Server option `replyTimeToLiveInMs`: time to live of the reply messages, at
   least 1 ms (a smaller value throws a `RangeError`). Not set by default.
+- `AZURE_SERVICE_BUS_TRANSPORT`, exported: the server's `transportId`, which
+  `@Subscription()` and `@Queue()` now declare as their transport, so NestJS
+  registers their handlers only on this transport's servers (see "Fixed").
 - Exported from the package root: the errors (`ReplyTimeoutError`,
   `InvalidMessageException`), the option and metadata interfaces
   (`AzureServiceBusOptions`, `AzureServiceBusClientOptions`,
@@ -94,6 +97,17 @@ These compile differently against 1.1.0 code:
 
 ### Fixed
 
+- Hybrid apps ([#216](https://github.com/Niurmiguel/nestjs-service-bus/issues/216)):
+  an application that ran this transport next to another one (TCP, Redis,
+  gRPC...) did not start. NestJS registers on every server the handlers that
+  declare no transport (e.g. `@MessagePattern({ cmd: 'sum' })`), and, since this
+  server had no `transportId`, also those declared for another transport; the
+  server threw on the first one that was not its own (1.1.0 crashed reading
+  its options). It now ignores them (logged once per pattern at debug level).
+  The other way round, `@Subscription()` and `@Queue()` handlers were
+  registered on the other servers too (a TCP client could call them with their
+  pattern); they now declare `AZURE_SERVICE_BUS_TRANSPORT`, so NestJS keeps
+  them off the servers of other transports.
 - Server: receivers were closed right after subscribing. With an AMQP
   connection already open nothing was received; otherwise messages could not
   be settled. Receivers now stay open while listening, and `close()` stops
@@ -232,6 +246,13 @@ Read these before upgrading a service that relies on the 1.1.0 behavior.
   duration loses the lock (the message is delivered again).
 - **Event handlers that return an Observable**: the message is settled when the
   Observable completes. One that never completes keeps its message locked.
+- **Handlers that are not this transport's**: a handler registered on the
+  server whose pattern is neither from `@Subscription()`/`@Queue()` nor has
+  `metaOptions` (e.g. `@EventPattern('orders')`) is ignored, with a debug log,
+  instead of failing `listen()`: in a hybrid application it belongs to another
+  transport. A handler of `@Subscription()`/`@Queue()` whose options cannot be
+  used (no queue or topic, a factory function, an option set to `undefined`)
+  still fails `listen()`.
 - **Peer dependency**: npm 7+ and pnpm now check that `@azure/service-bus`
   7.9.0 or later is installed.
 - **Mixed versions** (checked against the emulator, NestJS 10 and 11):

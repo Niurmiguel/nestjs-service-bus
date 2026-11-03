@@ -19,7 +19,13 @@ import { fileURLToPath } from "node:url";
 const require = createRequire(import.meta.url);
 const { ServiceBusClient } = require("@azure/service-bus");
 const { firstValueFrom } = require("rxjs");
-const { RpcException } = require("@nestjs/microservices");
+const { Module } = require("@nestjs/common");
+const {
+  ClientProxyFactory,
+  MessagePattern,
+  RpcException,
+  Transport,
+} = require("@nestjs/microservices");
 const nestVersion = require("@nestjs/microservices/package.json").version;
 const {
   AzureServiceBusClient,
@@ -40,6 +46,7 @@ const {
   startMicroservice,
   timeoutAfter,
 } = require("./helpers.js");
+const { freePort, startHybridApp } = require("../hybrid-app.js");
 
 const available = await emulatorAvailable();
 const required = process.env.SB_EMULATOR_REQUIRED === "1";
@@ -988,6 +995,63 @@ describe(
       assert.ok(closedIn < 5_000, `close() took ${closedIn} ms:\n${output()}`);
       assert.match(output(), /^replies=1$/m, output());
       assert.doesNotMatch(output(), /closeTimeoutInMs/);
+    });
+
+    test("a hybrid app with Nest's TCP microservice (#216): each server keeps its own handlers", async () => {
+      const got = deferred("a message on itest.hybrid");
+      const controller = defineController({
+        onJob: {
+          decorator: Queue({ queueName: "itest.hybrid", receiveMode: "peekLock" }),
+          fn: (message) => {
+            if (message.body?.runId === runId) got.resolve(message);
+          },
+        },
+        // No transport: NestJS registers it on both servers; ours ignores it.
+        sum: {
+          decorator: MessagePattern({ cmd: "sum" }),
+          fn: (numbers) => numbers.reduce((a, b) => a + b, 0),
+        },
+        ping: { decorator: MessagePattern({ cmd: "ping" }, Transport.TCP), fn: () => "pong" },
+      });
+      class AppModule {}
+      Module({ controllers: [controller] })(AppModule);
+
+      const logger = captureLogger();
+      const server = new AzureServiceBusServer({ connectionString: CONNECTION_STRING });
+      const port = await freePort();
+      const app = await startHybridApp(
+        AppModule,
+        [{ strategy: server }, { transport: Transport.TCP, options: { host: "127.0.0.1", port } }],
+        { logger }
+      );
+      const tcp = ClientProxyFactory.create({
+        transport: Transport.TCP,
+        options: { host: "127.0.0.1", port },
+      });
+      try {
+        // Service Bus: one receiver, for its own handler, which gets its message.
+        assert.deepEqual(
+          [...server.receivers.values()].map(({ receiver }) => receiver.entityPath),
+          ["itest.hybrid"]
+        );
+        await sendRaw("itest.hybrid", { runId, kind: "hybrid" });
+        assert.equal((await got.promise).body.kind, "hybrid");
+
+        // TCP: its handlers answer, and the Service Bus handler is not there.
+        assert.equal(await firstValueFrom(tcp.send({ cmd: "sum" }, [1, 2, 3])), 6);
+        assert.equal(await firstValueFrom(tcp.send({ cmd: "ping" }, {})), "pong");
+        const ourPattern = JSON.parse(
+          [...server.getHandlers().keys()].find((key) => key.includes("itest.hybrid"))
+        );
+        await assert.rejects(
+          firstValueFrom(tcp.send(ourPattern, {})),
+          /no matching message handler/
+        );
+        assert.deepEqual(logger.errors(), []);
+      } finally {
+        await tcp.close();
+        await app.close();
+      }
     });
 
     test("the process exits on its own after close() (no open handles)", async () => {

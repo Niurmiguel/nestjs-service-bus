@@ -3,6 +3,7 @@ import {
   WritePacket,
   CustomTransportStrategy,
   ReadPacket,
+  Transport,
 } from "@nestjs/microservices";
 import { BaseRpcContext } from "@nestjs/microservices/ctx-host/base-rpc.context";
 import {
@@ -26,9 +27,11 @@ import {
 import { inspect, InspectOptionsStylized } from "util";
 
 import {
+  AZURE_SERVICE_BUS_TRANSPORT,
   SB_REPLY_DISPOSED_PROPERTY,
   SB_REPLY_TYPE_PROPERTY,
   SB_REQUEST_ID_PROPERTY,
+  SB_SUBSCRIBER_EXTRA,
 } from "../azure-service-bus.constants";
 import { AzureServiceBusContext } from "../azure-service-bus.context";
 import {
@@ -44,6 +47,8 @@ import {
   readTimerOption,
   redactOptions,
 } from "../utils";
+
+export { AZURE_SERVICE_BUS_TRANSPORT };
 
 /** A receiver opened by `bindEvents()` and the subscription it is running. */
 interface ActiveReceiver {
@@ -173,9 +178,18 @@ export class AzureServiceBusServer
   extends Server
   implements CustomTransportStrategy
 {
+  /**
+   * `AZURE_SERVICE_BUS_TRANSPORT`, the transport that `@Subscription()` and
+   * `@Queue()` declare. In a hybrid application NestJS registers on this
+   * server only those handlers and the ones that declare no transport (the
+   * latter are ignored by `bindEvents()`).
+   */
+  transportId: Transport | symbol = AZURE_SERVICE_BUS_TRANSPORT;
   private sbClient: ServiceBusClient;
   /** Receivers kept open while listening, by handler pattern. */
   private readonly receivers = new Map<string, ActiveReceiver>();
+  /** Handler patterns of other transports, already logged by `bindEvents()`. */
+  private readonly ignoredPatterns = new Set<string>();
   /** Messages being handled right now, so `close()` can wait for them. */
   private readonly inFlight = new Set<Promise<void>>();
   /**
@@ -244,15 +258,31 @@ export class AzureServiceBusServer
   }
 
   /**
-   * Opens one receiver per registered handler and keeps it open until
+   * Opens one receiver per handler of this transport and keeps it open until
    * `close()`. Handlers that already have a receiver are skipped.
+   *
+   * In a hybrid application NestJS also registers here the handlers that
+   * declare no transport, such as `@MessagePattern({ cmd: "sum" })` meant for
+   * a TCP or Redis server of the same application: those are not Azure
+   * Service Bus patterns, so they are ignored (logged once, at debug level).
+   * A handler of this transport whose options cannot be used still fails.
    */
   async bindEvents(): Promise<void> {
     for (const pattern of this.messageHandlers.keys()) {
-      if (this.receivers.has(pattern)) {
+      if (this.receivers.has(pattern) || this.ignoredPatterns.has(pattern)) {
         continue;
       }
-      const { metaOptions } = this.parsePattern(pattern);
+      const parsed = this.parsePattern(pattern);
+      if (!parsed) {
+        this.ignoredPatterns.add(pattern);
+        this.logger.debug?.(
+          `Ignored the handler pattern ${quote(pattern)}: it is not an Azure Service Bus ` +
+            "pattern (@Subscription() or @Queue()), so it is left to the other transports " +
+            "of the application."
+        );
+        continue;
+      }
+      const { metaOptions } = parsed;
       const receiver = this.createReceiver(metaOptions, pattern);
       const abortController = new AbortController();
       const subscription = receiver.subscribe(this.createMessageHandlers(pattern), {
@@ -949,15 +979,37 @@ export class AzureServiceBusServer
     })}`;
   }
 
-  private parsePattern(pattern: string): SubscriberPattern {
+  /**
+   * Reads the options of a handler of this transport, or returns `undefined`
+   * for a handler of another one. A handler is this transport's when
+   * `@Subscription()`/`@Queue()` declared it (their mark in the handler's
+   * extras), or when its pattern has `metaOptions` (a hand-written
+   * `@EventPattern({ metaOptions })`, as 1.1.0 allowed). Such a handler fails
+   * here when its options cannot be used, rather than being ignored.
+   */
+  private parsePattern(pattern: string): SubscriberPattern | undefined {
+    const extras = this.messageHandlers.get(pattern)?.extras;
+    const declaredHere = extras?.[SB_SUBSCRIBER_EXTRA] === true;
     let parsed: unknown;
     try {
       parsed = JSON.parse(pattern);
     } catch (err) {
+      if (!declaredHere) {
+        return undefined; // e.g. a plain string pattern of another transport
+      }
       throw new Error(
         `Cannot read the Azure Service Bus options of the handler pattern ${pattern}: ${err}. ` +
-          "Handlers on this transport must use @Subscription() or @Queue() with plain JSON values."
+          "@Subscription() and @Queue() take plain JSON values: no factory function, and no " +
+          "option set to undefined (leave it out instead)."
       );
+    }
+    const hasOptions =
+      typeof parsed === "object" &&
+      parsed !== null &&
+      !Array.isArray(parsed) &&
+      "metaOptions" in parsed;
+    if (!hasOptions && !declaredHere) {
+      return undefined; // e.g. { cmd: "sum" } of another transport
     }
     const metaOptions = (parsed as SubscriberPattern | null)?.metaOptions;
     if (typeof metaOptions !== "object" || metaOptions === null) {
